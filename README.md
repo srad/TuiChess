@@ -19,17 +19,23 @@ Play chess against an engine in your terminal.
 ## Features
 
 - Block-art pieces that scale with the terminal, with Unicode glyphs as a fallback for small windows
-- Mouse and keyboard input: click a piece and then its target, or use the arrow keys or `hjkl`
-- Play as White or Black; the board flips so your side is always at the bottom
+- Mouse and keyboard input: click or drag pieces, or use the arrow keys or `hjkl`
+- Play as White or Black against the engine, or two players on one machine
 - Stockfish 19 is built into the executable: nothing else to install
-- Fallback engine written in Rust: iterative-deepening alpha-beta search (PVS), a transposition table, quiescence search, killer moves and a tapered [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) evaluation
-- Any other UCI engine can be used instead
-- Evaluation bar with the score in centipawns or moves to mate
-- Four colour themes: Wood, Forest, Ocean and Slate
+- Eight difficulty levels, from about 1320 Elo to full-strength Stockfish
+- Hints: the engine suggests your best move
+- Chess clocks (1+0 up to 15+10) with loss or draw on time
+- Resign and draw offers; the engine accepts a draw when it is not better
+- Live evaluation bar and the engine's expected line while it thinks
+- Step back through the game's positions without undoing moves
+- Start from any position given as FEN
 - Undo, which takes back your last move and the engine's reply
 - Move list in algebraic notation with piece symbols (`♘f3`, `Nbd2`, `O-O`, `e8=Q#`)
 - Full rules: castling, en passant, promotion, checkmate, stalemate, threefold repetition, the fifty-move rule and insufficient material
-- Highlights for the last move, legal targets, captures and check
+- Four colour themes: Wood, Forest, Ocean and Slate
+- Settings (theme, side, level, mode, clock) are remembered between runs
+- Fallback engine written in Rust: iterative-deepening alpha-beta search (PVS), a transposition table, quiescence search, killer moves and a tapered [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) evaluation
+- Any other UCI engine can be used instead
 
 ## Installation
 
@@ -60,19 +66,48 @@ Stockfish is bundled for Windows (x86-64, ARM64), Linux with glibc (x86-64, ARM6
 
 Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. A larger window shows larger pieces.
 
+## Usage
+
+```sh
+tuichess                                   # play from the start position
+tuichess --fen "8/8/8/4k3/8/8/4P3/4K3 w - -"   # start from a position (move counters optional)
+tuichess --help
+```
+
 ## Controls
 
 | Key | Action |
 | --- | --- |
 | `←` `↑` `↓` `→` / `h` `j` `k` `l` | Move the cursor |
 | `Enter` / left click | Select a piece, then its target |
+| Drag with the mouse | Move a piece |
 | `Esc` | Cancel the selection |
-| `Q` `R` `B` `N` | Choose the promotion piece |
+| `Q` `R` `B` `N` or click | Choose the promotion piece |
 | `u` | Undo |
-| `r` | Restart with the same side |
+| `r` | Restart |
 | `n` | New game with sides swapped |
+| `m` | Switch between playing the engine and two players |
+| `f` | Flip the board |
+| `+` / `-` | Stronger / weaker engine |
+| `s` | Suggest a move |
+| `c` | Clock for the next game (off, 1+0, 3+2, 5+3, 10+5, 15+10) |
+| `x` | Resign (press twice) |
+| `d` | Offer a draw (press twice) |
+| `,` / `.` | Step back / forward through the game |
+| `Home` / `End` | First / current position |
 | `t` | Next colour theme |
+| `?` / `F1` | Show all keys |
 | `q` / `Ctrl+C` | Quit |
+
+`r`, `n` and `m` ask for a second press while a game is in progress.
+
+## Difficulty and clocks
+
+Levels 1 to 7 limit Stockfish to about 1320, 1500, 1700, 1900, 2100, 2400 and 2800 Elo. Level 8 is full strength. Without a clock the engine thinks for 1 second per move. With a clock it manages its own time.
+
+The clock starts after the first move. Running out of time loses, unless the opponent has only a king, or a king and one minor piece, which is a draw.
+
+Theme, side, level, mode and clock are saved in `settings.txt` in your config directory (`%APPDATA%\TuiChess` on Windows, `~/Library/Application Support/TuiChess` on macOS, `~/.config/TuiChess` on Linux). The help screen (`?`) shows the exact path.
 
 ## Engine
 
@@ -81,9 +116,9 @@ At startup, TuiChess picks the first engine that works:
 1. `CHESS_ENGINE=<path>`: any UCI engine binary
 2. The bundled Stockfish 19. On first start it is written to your user cache directory (`%LOCALAPPDATA%\TuiChess` on Windows, `~/Library/Caches/TuiChess` on macOS, `~/.cache/TuiChess` on Linux) and reused after that.
 3. `stockfish` on your `PATH`
-4. The Rust engine, which thinks for about 1.5 s per move
+4. The Rust engine, which thinks for up to 1 second per move depending on the level
 
-Stockfish gets 1 second per move and plays at full strength.
+Stockfish uses all but one CPU core and 256 MB of hash. If it stops answering, TuiChess restarts it; if that happens twice within a minute, it switches to the Rust engine.
 
 Set `CHESS_ENGINE=builtin` to always use the Rust engine:
 
@@ -103,12 +138,15 @@ The panel shows which engine is playing.
 
 ```
 src/
-├── main.rs     # terminal setup, event loop, keyboard and mouse input
-├── game.rs     # game state, rules, draw detection, notation, undo
+├── main.rs     # command line, terminal setup, event loop
+├── app.rs      # app state: keys, mouse, searches, confirmations, browsing
+├── game.rs     # game state, rules, draw detection, notation, undo, results
+├── clock.rs    # time controls and the chess clock
+├── settings.rs # remembered preferences
 ├── ai.rs       # Rust engine: search and PeSTO evaluation
-├── engine.rs   # engine selection and UCI protocol
+├── engine.rs   # engine selection, levels and UCI protocol
 ├── bundled.rs  # embedded Stockfish binary and its extraction
-└── ui.rs       # board, panel, themes, evaluation bar (ratatui)
+└── ui.rs       # board, panel, popups, themes (ratatui)
 build.rs        # downloads, verifies and extracts Stockfish at build time
 ```
 

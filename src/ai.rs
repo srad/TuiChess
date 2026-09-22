@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use chess::{ALL_PIECES, Board, ChessMove, Color, EMPTY, MoveGen, Piece};
 
-use crate::engine::{Eval, SearchRequest, SearchResult};
+use crate::engine::{Eval, SearchInfo, SearchLimit, SearchRequest, SearchResult};
 
 const INF: i32 = 32_000;
 const MATE: i32 = 30_000;
@@ -437,16 +437,61 @@ fn to_eval(score: i32) -> Eval {
     }
 }
 
-/// Best move for the current position of `req`, searching for about `limit`.
-/// Returns `None` when there is no legal move.
-pub fn search(req: &SearchRequest, limit: Duration) -> Option<SearchResult> {
+/// Thinking time for `req`: the level's time, capped by the request's move time or, with a
+/// clock, by a share of the remaining time.
+fn time_budget(req: &SearchRequest, side: Color) -> Duration {
+    let level_time = req.level.builtin_time();
+    match req.limit {
+        SearchLimit::MoveTime(d) => level_time.min(d),
+        SearchLimit::Clock(times) => {
+            let remaining = times.for_side(side);
+            level_time
+                .min(remaining / 30 + times.increment / 2)
+                .min(remaining.saturating_sub(Duration::from_millis(50)))
+                .max(Duration::from_millis(10))
+        }
+    }
+}
+
+impl Searcher {
+    /// The expected line after `first`, following transposition-table moves; each is checked
+    /// for legality and the walk stops at a repeated position.
+    fn principal_variation(&self, board: &Board, first: ChessMove, depth: usize) -> Vec<ChessMove> {
+        let mut pv = vec![first];
+        let mut board = board.make_move_new(first);
+        let mut seen = vec![board.get_hash()];
+        while pv.len() < depth {
+            let Some(mv) = self.tt_probe(board.get_hash()).and_then(|e| e.mv) else {
+                break;
+            };
+            if !MoveGen::new_legal(&board).any(|m| m == mv) {
+                break;
+            }
+            pv.push(mv);
+            board = board.make_move_new(mv);
+            if seen.contains(&board.get_hash()) {
+                break;
+            }
+            seen.push(board.get_hash());
+        }
+        pv
+    }
+}
+
+/// Best move for the current position of `req`. `on_progress` is called after each completed
+/// depth. Returns `None` when there is no legal move.
+pub fn search(
+    req: &SearchRequest,
+    on_progress: &mut dyn FnMut(SearchInfo),
+) -> Option<SearchResult> {
     let (board, history) = req.replay();
     let first = MoveGen::new_legal(&board).next()?;
+    let side = board.side_to_move();
     let mut searcher = Searcher {
         tt: vec![None; TT_SIZE],
         killers: [[None; 2]; MAX_PLY],
         path: history,
-        deadline: Instant::now() + limit,
+        deadline: Instant::now() + time_budget(req, side),
         nodes: 0,
         can_stop: false,
         stopped: false,
@@ -454,7 +499,7 @@ pub fn search(req: &SearchRequest, limit: Duration) -> Option<SearchResult> {
     };
     let mut result = SearchResult {
         mv: first,
-        eval: to_eval(evaluate(&board)).for_white(board.side_to_move()),
+        eval: to_eval(evaluate(&board)).for_white(side),
         depth: 0,
     };
     for depth in 1..MAX_PLY as i32 {
@@ -465,9 +510,14 @@ pub fn search(req: &SearchRequest, limit: Duration) -> Option<SearchResult> {
         if let Some(mv) = searcher.root_best {
             result = SearchResult {
                 mv,
-                eval: to_eval(score).for_white(board.side_to_move()),
+                eval: to_eval(score).for_white(side),
                 depth: depth as u32,
             };
+            on_progress(SearchInfo {
+                eval: result.eval,
+                depth: result.depth,
+                pv: searcher.principal_variation(&board, mv, depth as usize),
+            });
         }
         searcher.can_stop = true;
         if score.abs() > MATE_BOUND || Instant::now() >= searcher.deadline {
@@ -482,27 +532,68 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    const LIMIT: Duration = Duration::from_millis(300);
+    use crate::clock::ClockTimes;
+    use crate::engine::Level;
+
+    fn request(board: Board) -> SearchRequest {
+        SearchRequest {
+            id: 0,
+            root: board,
+            moves: Vec::new(),
+            level: Level::MAX,
+            limit: SearchLimit::MoveTime(Duration::from_millis(300)),
+        }
+    }
 
     fn best(fen: &str) -> (Board, SearchResult) {
         let board = Board::from_str(fen).unwrap();
-        let req = SearchRequest {
-            root: board,
-            moves: Vec::new(),
-        };
-        (board, search(&req, LIMIT).expect("must find a move"))
+        let res = search(&request(board), &mut |_| {}).expect("must find a move");
+        (board, res)
     }
 
     #[test]
     fn best_move_is_legal_from_start() {
         let board = Board::default();
-        let req = SearchRequest {
-            root: board,
-            moves: Vec::new(),
-        };
-        let res = search(&req, LIMIT).expect("must find a move");
+        let res = search(&request(board), &mut |_| {}).expect("must find a move");
         assert!(MoveGen::new_legal(&board).any(|m| m == res.mv));
         assert!(res.depth >= 1);
+    }
+
+    #[test]
+    fn progress_reports_deepening_legal_lines() {
+        let board = Board::default();
+        let mut infos = Vec::new();
+        let res = search(&request(board), &mut |info| infos.push(info)).unwrap();
+        assert!(infos.len() >= 2);
+        assert!(infos.windows(2).all(|w| w[0].depth < w[1].depth));
+        let last = infos.last().unwrap();
+        assert_eq!(last.pv[0], res.mv);
+        let mut b = board;
+        for &mv in &last.pv {
+            assert!(MoveGen::new_legal(&b).any(|m| m == mv));
+            b = b.make_move_new(mv);
+        }
+    }
+
+    #[test]
+    fn time_budget_follows_level_and_clock() {
+        let mut req = request(Board::default());
+        req.level = Level::new(1);
+        assert_eq!(time_budget(&req, Color::White), Duration::from_millis(50));
+        req.level = Level::MAX;
+        req.limit = SearchLimit::Clock(ClockTimes {
+            white: Duration::from_secs(30),
+            black: Duration::from_secs(300),
+            increment: Duration::from_secs(2),
+        });
+        // 30 s / 30 + 2 s / 2 = 2 s, capped by the level's 1 s.
+        assert_eq!(time_budget(&req, Color::White), Duration::from_secs(1));
+        req.limit = SearchLimit::Clock(ClockTimes {
+            white: Duration::from_millis(40),
+            black: Duration::from_secs(300),
+            increment: Duration::ZERO,
+        });
+        assert_eq!(time_budget(&req, Color::White), Duration::from_millis(10));
     }
 
     #[test]
@@ -538,11 +629,7 @@ mod tests {
         let board =
             Board::from_str("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3")
                 .unwrap();
-        let req = SearchRequest {
-            root: board,
-            moves: Vec::new(),
-        };
-        assert!(search(&req, LIMIT).is_none());
+        assert!(search(&request(board), &mut |_| {}).is_none());
     }
 
     #[test]

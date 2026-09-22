@@ -1,39 +1,105 @@
 mod ai;
+mod app;
 #[cfg(bundled_stockfish)]
 mod bundled;
+mod clock;
 mod engine;
 mod game;
+mod settings;
 mod ui;
 
 use std::io;
 use std::panic;
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
-use chess::{Board, Color, Piece};
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEventKind,
-    },
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Position, Rect},
-};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
-use engine::{Engine, SearchResult};
-use game::{Game, Phase};
+use app::{App, Flow};
+use engine::Engine;
+use game::StartPosition;
+use settings::Settings;
+
+const USAGE: &str = "\
+Usage: tuichess [--fen \"<FEN>\"]
+
+Play chess against Stockfish (or a second player) in the terminal.
+
+Options:
+  --fen <FEN>   start from this position (move counters optional)
+  --help        show this help
+  --version     show the version
+
+Environment:
+  CHESS_ENGINE  path to a UCI engine to use instead, or `builtin`
+
+In the game, press ? for the keys.";
+
+/// What the command line asks for.
+enum Command {
+    Play(StartPosition),
+    Help,
+    Version,
+}
+
+fn parse_args(args: &[String]) -> Result<Command, String> {
+    let mut start = StartPosition::default();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(Command::Help),
+            "--version" | "-V" => return Ok(Command::Version),
+            "--fen" => {
+                let fen = rest.next().ok_or("--fen needs a position")?;
+                start = StartPosition::from_fen(fen)?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    Ok(Command::Play(start))
+}
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
-fn main() -> io::Result<()> {
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let start = match parse_args(&args) {
+        Ok(Command::Play(start)) => start,
+        Ok(Command::Help) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Command::Version) => {
+            print!("tuichess {}", env!("CARGO_PKG_VERSION"));
+            #[cfg(bundled_stockfish)]
+            print!(" (Stockfish {})", env!("TUICHESS_STOCKFISH_TAG"));
+            println!();
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("tuichess: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match play(start) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("tuichess: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn play(start: StartPosition) -> io::Result<()> {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         // A panicking search thread must not tear down the live UI; main reports it instead.
@@ -43,137 +109,74 @@ fn main() -> io::Result<()> {
         default_hook(info);
     }));
 
+    let settings_path = settings::default_path();
+    let settings = settings_path
+        .as_deref()
+        .map_or_else(Settings::default, Settings::load);
     println!("Starting engine…"); // the first start unpacks ~100 MB; the alt screen hides this after
-    let engine = Engine::detect();
+    let mut app = App::new(Engine::detect(), settings, settings_path, start);
+
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let result = run(&mut terminal, &engine);
+    let result = run(&mut terminal, &mut app);
 
     restore_terminal();
     terminal.show_cursor()?;
     result
 }
 
-/// A search in flight and the position it was started from.
-struct Pending {
-    searched: Board,
-    rx: Receiver<Option<SearchResult>>,
-}
-
-fn promotion_piece(c: char) -> Option<Piece> {
-    match c.to_ascii_lowercase() {
-        'q' => Some(Piece::Queen),
-        'r' => Some(Piece::Rook),
-        'b' => Some(Piece::Bishop),
-        'n' => Some(Piece::Knight),
-        _ => None,
-    }
-}
-
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, engine: &Engine) -> io::Result<()> {
-    let mut game = Game::new(Color::White);
-    let mut pending: Option<Pending> = None;
-    // Set when a search yields no usable move; blocks re-searching until the user acts.
-    let mut engine_failed = false;
-    let mut theme = 0usize;
-    let mut tick: u64 = 0;
-
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
-        tick = tick.wrapping_add(1);
-
-        if let Some(p) = &pending {
-            match p.rx.try_recv() {
-                Ok(Some(res)) => {
-                    if game.apply_engine_move(&p.searched, res.mv) {
-                        game.eval = Some(res.eval);
-                    } else {
-                        engine_failed = true;
-                    }
-                    pending = None;
-                }
-                Ok(None) | Err(TryRecvError::Disconnected) => {
-                    engine_failed = true;
-                    pending = None;
-                    terminal.clear()?; // a panicking search thread may have printed over the UI
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if pending.is_none() && !engine_failed && !game.game_over() && !game.is_human_turn() {
-            pending = Some(Pending {
-                searched: game.board,
-                rx: engine.think(game.search_request()),
-            });
-        }
-
-        let view = ui::View {
-            theme: &ui::THEMES[theme],
-            tick,
-            thinking: pending.is_some(),
-            engine_name: engine.name(),
-            notice: engine_failed.then_some("Engine failed: u/r/n"),
-        };
-        terminal.draw(|f| ui::draw(f, &game, &view))?;
+        let now = Instant::now();
+        app.tick(now);
+        terminal.draw(|f| ui::draw(f, &app.game, &app.view(now)))?;
 
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let promoting = matches!(game.phase, Phase::Promoting { .. });
-        match event::read()? {
-            // Windows emits both Press and Release key events — handle Press only
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Esc => game.cancel(),
-                KeyCode::Left | KeyCode::Char('h') => game.move_cursor(-1, 0),
-                KeyCode::Right | KeyCode::Char('l') => game.move_cursor(1, 0),
-                KeyCode::Up | KeyCode::Char('k') => game.move_cursor(0, 1),
-                KeyCode::Down | KeyCode::Char('j') => game.move_cursor(0, -1),
-                KeyCode::Enter => {
-                    game.confirm();
-                }
-                KeyCode::Char(c) if promoting => {
-                    if let Some(piece) = promotion_piece(c) {
-                        game.promote(piece);
-                    }
-                }
-                KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                    'q' => break,
-                    'u' => {
-                        game.undo();
-                        pending = None; // orphaned search's result is discarded
-                        engine_failed = false;
-                    }
-                    'r' => {
-                        game.restart();
-                        pending = None;
-                        engine_failed = false;
-                    }
-                    'n' => {
-                        game = Game::new(!game.human);
-                        pending = None;
-                        engine_failed = false;
-                    }
-                    't' => theme = (theme + 1) % ui::THEMES.len(),
-                    _ => {}
-                },
-                _ => {}
-            },
-            Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) && !promoting => {
+        let now = Instant::now();
+        let flow = match event::read()? {
+            Event::Key(key) => app.on_key(key, now),
+            Event::Mouse(mouse) => {
                 let size = terminal.size()?;
-                let area = Rect::new(0, 0, size.width, size.height);
-                let click = Position {
-                    x: m.column,
-                    y: m.row,
-                };
-                if let Some(sq) = ui::square_at(area, game.human, click) {
-                    game.set_cursor(sq);
-                    game.confirm();
-                }
+                app.on_mouse(mouse, Rect::new(0, 0, size.width, size.height), now)
             }
-            _ => {}
+            _ => Flow::Continue,
+        };
+        if flow == Flow::Quit {
+            return Ok(());
         }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_command_line() {
+        assert!(
+            matches!(parse_args(&args(&[])), Ok(Command::Play(s)) if s == StartPosition::default())
+        );
+        assert!(matches!(parse_args(&args(&["--help"])), Ok(Command::Help)));
+        assert!(matches!(
+            parse_args(&args(&["--version"])),
+            Ok(Command::Version)
+        ));
+        let Ok(Command::Play(start)) =
+            parse_args(&args(&["--fen", "4k3/8/8/8/8/8/8/4K3 b - - 3 20"]))
+        else {
+            panic!("FEN not accepted");
+        };
+        assert_eq!(start.fullmove, 20);
+        assert!(parse_args(&args(&["--fen"])).is_err());
+        assert!(parse_args(&args(&["--fen", "nonsense"])).is_err());
+        assert!(parse_args(&args(&["--bogus"])).is_err());
+    }
 }

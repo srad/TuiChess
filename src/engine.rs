@@ -6,17 +6,20 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chess::{Board, ChessMove, Color, MoveGen};
 
 use crate::ai;
+use crate::clock::ClockTimes;
 
-const BUILTIN_TIME: Duration = Duration::from_millis(1500);
-const UCI_MOVETIME_MS: u64 = 1000;
 /// Generous: the first start of a ~100 MB engine binary may include an antivirus scan.
 const UCI_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const UCI_HASH_MB: u64 = 256;
+/// Our pipe and UI tick add latency that Stockfish's 10 ms default does not cover.
+const UCI_MOVE_OVERHEAD_MS: u64 = 100;
 
 /// Position score from White's point of view.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,11 +43,60 @@ impl Eval {
     }
 }
 
+/// Playing strength, 1 (weakest) to 8 (full strength).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub struct Level(u8);
+
+impl Level {
+    pub const MIN: Level = Level(1);
+    pub const MAX: Level = Level(8);
+    pub const DEFAULT: Level = Level(4);
+
+    const ELO: [u32; 7] = [1320, 1500, 1700, 1900, 2100, 2400, 2800];
+    const BUILTIN_MS: [u64; 8] = [50, 100, 150, 250, 400, 600, 800, 1000];
+
+    pub fn new(n: u8) -> Level {
+        Level(n.clamp(Self::MIN.0, Self::MAX.0))
+    }
+
+    pub fn get(self) -> u8 {
+        self.0
+    }
+
+    pub fn stronger(self) -> Level {
+        Level::new(self.0 + 1)
+    }
+
+    pub fn weaker(self) -> Level {
+        Level::new(self.0.saturating_sub(1))
+    }
+
+    /// Stockfish's `UCI_Elo` for this level; `None` at full strength.
+    pub fn elo(self) -> Option<u32> {
+        Self::ELO.get(usize::from(self.0 - 1)).copied()
+    }
+
+    /// Thinking time of the built-in engine.
+    pub fn builtin_time(self) -> Duration {
+        Duration::from_millis(Self::BUILTIN_MS[usize::from(self.0 - 1)])
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SearchLimit {
+    MoveTime(Duration),
+    Clock(ClockTimes),
+}
+
 /// A game to search: the starting position plus every move played since.
 #[derive(Clone, Debug)]
 pub struct SearchRequest {
+    /// Increasing per request; used to cancel.
+    pub id: u64,
     pub root: Board,
     pub moves: Vec<ChessMove>,
+    pub level: Level,
+    pub limit: SearchLimit,
 }
 
 impl SearchRequest {
@@ -60,11 +112,31 @@ impl SearchRequest {
     }
 }
 
+/// Progress of a running search.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SearchInfo {
+    pub eval: Eval,
+    pub depth: u32,
+    /// Expected line, starting with the move to play; legal from the searched position.
+    pub pv: Vec<ChessMove>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SearchResult {
     pub mv: ChessMove,
     pub eval: Eval,
     pub depth: u32,
+}
+
+#[derive(Clone, Debug)]
+pub enum SearchEvent {
+    Progress(SearchInfo),
+    /// `result` is `None` when the position has no legal move. `at` is when the engine
+    /// answered, so the clock can judge the move by that time rather than when it is read.
+    Done {
+        result: Option<SearchResult>,
+        at: Instant,
+    },
 }
 
 pub enum Engine {
@@ -101,30 +173,59 @@ impl Engine {
         }
     }
 
-    /// Starts searching `req`; the result arrives on the returned channel.
-    /// `None` means the position has no legal move.
-    pub fn think(&self, req: SearchRequest) -> Receiver<Option<SearchResult>> {
+    /// Starts searching `req`; progress and the result arrive on the returned channel.
+    /// A disconnect without `Done` means the engine died.
+    pub fn think(&self, req: SearchRequest) -> Receiver<SearchEvent> {
         let (tx, rx) = mpsc::channel();
         match self {
             Engine::Builtin => {
-                thread::spawn(move || {
-                    let _ = tx.send(ai::search(&req, BUILTIN_TIME));
-                });
+                thread::spawn(move || builtin_search(&req, &tx));
             }
             Engine::Uci(uci) => {
-                // Worker gone (engine thread died) drops `tx`; main sees a disconnect.
                 let _ = uci.requests.send((req, tx));
             }
         }
         rx
     }
+
+    /// Abandons request `id`: stops it if it is running and skips it if it is still queued.
+    pub fn cancel(&self, id: u64) {
+        if let Engine::Uci(uci) = self {
+            let mut shared = uci.shared.lock().unwrap_or_else(|e| e.into_inner());
+            shared.min_live_id = shared.min_live_id.max(id + 1);
+            if shared.active == Some(id) {
+                // Only while this very search runs, so a `stop` can never hit a newer one.
+                let _ = writeln!(shared.stdin, "stop").and_then(|_| shared.stdin.flush());
+            }
+        }
+    }
 }
 
-type Request = (SearchRequest, Sender<Option<SearchResult>>);
+fn builtin_search(req: &SearchRequest, tx: &Sender<SearchEvent>) {
+    let result = ai::search(req, &mut |info| {
+        let _ = tx.send(SearchEvent::Progress(info));
+    });
+    let _ = tx.send(SearchEvent::Done {
+        result,
+        at: Instant::now(),
+    });
+}
+
+type Request = (SearchRequest, Sender<SearchEvent>);
+
+/// State the worker and `Engine::cancel` share.
+struct Shared {
+    stdin: ChildStdin,
+    /// The request whose `go` is running.
+    active: Option<u64>,
+    /// Queued requests below this id were cancelled and are skipped.
+    min_live_id: u64,
+}
 
 pub struct UciEngine {
     name: String,
     requests: Sender<Request>,
+    shared: Arc<Mutex<Shared>>,
     child: Child,
 }
 
@@ -139,12 +240,23 @@ impl UciEngine {
             .ok()?;
         let stdin = child.stdin.take()?;
         let stdout = BufReader::new(child.stdout.take()?);
+        let shared = Arc::new(Mutex::new(Shared {
+            stdin,
+            active: None,
+            min_live_id: 0,
+        }));
         let (ready_tx, ready_rx) = mpsc::channel();
         let (req_tx, req_rx) = mpsc::channel::<Request>();
 
+        let worker_shared = Arc::clone(&shared);
         thread::spawn(move || {
-            let mut io = UciIo { stdin, stdout };
-            match io.handshake() {
+            let mut worker = UciWorker {
+                shared: worker_shared,
+                stdout,
+                level: None,
+                root: None,
+            };
+            match worker.handshake() {
                 Ok(name) => {
                     let _ = ready_tx.send(name);
                 }
@@ -152,10 +264,24 @@ impl UciEngine {
             }
             // One request at a time, so a stale search never interleaves with a new one.
             for (req, reply) in req_rx {
-                let result = io
-                    .search(&req)
-                    .unwrap_or_else(|_| ai::search(&req, BUILTIN_TIME));
-                let _ = reply.send(result);
+                if req.id < worker.lock().min_live_id {
+                    continue; // cancelled while queued
+                }
+                match worker.search(&req, &reply) {
+                    Ok(Searched::Done(result)) => {
+                        let _ = reply.send(SearchEvent::Done {
+                            result,
+                            at: Instant::now(),
+                        });
+                    }
+                    Ok(Searched::Cancelled) => {}
+                    Err(_) => {
+                        // The engine is gone: answer this request ourselves, then stop so
+                        // the next request sees a disconnect and the app restarts the engine.
+                        builtin_search(&req, &reply);
+                        return;
+                    }
+                }
             }
         });
 
@@ -163,6 +289,7 @@ impl UciEngine {
             Ok(name) => Some(UciEngine {
                 name,
                 requests: req_tx,
+                shared,
                 child,
             }),
             Err(_) => {
@@ -181,15 +308,24 @@ impl Drop for UciEngine {
     }
 }
 
-struct UciIo {
-    stdin: ChildStdin,
+struct UciWorker {
+    shared: Arc<Mutex<Shared>>,
     stdout: BufReader<ChildStdout>,
+    /// Strength currently set in the engine.
+    level: Option<Level>,
+    /// Root of the previous request, to send `ucinewgame` when a new game starts.
+    root: Option<Board>,
 }
 
-impl UciIo {
-    fn send(&mut self, cmd: &str) -> io::Result<()> {
-        writeln!(self.stdin, "{cmd}")?;
-        self.stdin.flush()
+impl UciWorker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn send(&self, cmd: &str) -> io::Result<()> {
+        let mut shared = self.lock();
+        writeln!(shared.stdin, "{cmd}")?;
+        shared.stdin.flush()
     }
 
     fn read_line(&mut self) -> io::Result<String> {
@@ -200,25 +336,59 @@ impl UciIo {
         Ok(line)
     }
 
+    fn wait_ready(&mut self) -> io::Result<()> {
+        self.send("isready")?;
+        while self.read_line()?.trim() != "readyok" {}
+        Ok(())
+    }
+
     /// Returns the engine's name.
     fn handshake(&mut self) -> io::Result<String> {
         self.send("uci")?;
         let mut name = "UCI engine".to_string();
+        let mut spin_max: Vec<(String, u64)> = Vec::new();
         loop {
             let line = self.read_line()?;
-            if let Some(n) = line.trim().strip_prefix("id name ") {
+            let line = line.trim();
+            if let Some(n) = line.strip_prefix("id name ") {
                 name = n.to_string();
             }
-            if line.trim() == "uciok" {
+            if let Some(option) = parse_spin_option(line) {
+                spin_max.push(option);
+            }
+            if line == "uciok" {
                 break;
             }
         }
-        self.send("isready")?;
-        while self.read_line()?.trim() != "readyok" {}
+        let max = |option: &str| spin_max.iter().find(|(n, _)| n == option).map(|&(_, m)| m);
+        let cores = thread::available_parallelism().map_or(1, |n| n.get() as u64);
+        let wanted = [
+            ("Threads", cores.saturating_sub(1).max(1)),
+            ("Hash", UCI_HASH_MB),
+            ("Move Overhead", UCI_MOVE_OVERHEAD_MS),
+        ];
+        for (option, value) in wanted {
+            if let Some(max) = max(option) {
+                self.send(&format!("setoption name {option} value {}", value.min(max)))?;
+            }
+        }
+        self.wait_ready()?;
         Ok(name)
     }
 
-    fn search(&mut self, req: &SearchRequest) -> io::Result<Option<SearchResult>> {
+    fn search(&mut self, req: &SearchRequest, reply: &Sender<SearchEvent>) -> io::Result<Searched> {
+        if self.root != Some(req.root) {
+            self.send("ucinewgame")?;
+            self.root = Some(req.root);
+        }
+        if self.level != Some(req.level) {
+            for (option, value) in uci_level_options(req.level) {
+                self.send(&format!("setoption name {option} value {value}"))?;
+            }
+            self.wait_ready()?;
+            self.level = Some(req.level);
+        }
+
         let mut position = format!("position fen {}", req.root);
         if !req.moves.is_empty() {
             position.push_str(" moves");
@@ -226,44 +396,115 @@ impl UciIo {
                 position.push_str(&format!(" {mv}"));
             }
         }
-        self.send(&position)?;
-        self.send(&format!("go movetime {UCI_MOVETIME_MS}"))?;
+        let go = match req.limit {
+            SearchLimit::MoveTime(d) => format!("go movetime {}", d.as_millis()),
+            SearchLimit::Clock(t) => format!(
+                "go wtime {} btime {} winc {} binc {}",
+                t.white.as_millis(),
+                t.black.as_millis(),
+                t.increment.as_millis(),
+                t.increment.as_millis()
+            ),
+        };
+        {
+            // Checking for cancellation, writing `go` and marking the search active happen
+            // under one lock, so `Engine::cancel` either skips the request or stops it.
+            let mut shared = self.lock();
+            if req.id < shared.min_live_id {
+                return Ok(Searched::Cancelled);
+            }
+            writeln!(shared.stdin, "{position}")?;
+            writeln!(shared.stdin, "{go}")?;
+            shared.stdin.flush()?;
+            shared.active = Some(req.id);
+        }
 
         let (board, _) = req.replay();
-        let mut last_info: Option<(u32, Eval)> = None;
+        let side = board.side_to_move();
+        let mut last: Option<(u32, Eval)> = None;
         let best = loop {
             let line = self.read_line()?;
-            if let Some(info) = parse_info(&line) {
-                last_info = Some(info);
+            if let Some(info) = parse_info(&line)
+                && !info.bound
+            {
+                let eval = info.eval.for_white(side);
+                last = Some((info.depth, eval));
+                let pv = legal_line(&board, &info.pv);
+                if !pv.is_empty() {
+                    let _ = reply.send(SearchEvent::Progress(SearchInfo {
+                        eval,
+                        depth: info.depth,
+                        pv,
+                    }));
+                }
             }
             if let Some(best) = parse_bestmove(&line) {
+                self.lock().active = None;
                 break best.and_then(|s| ChessMove::from_str(s).ok());
             }
         };
-        let Some(mv) = best else {
-            return Ok(None);
-        };
-        if !MoveGen::new_legal(&board).any(|m| m == mv) {
-            return Ok(None);
-        }
-        let (depth, eval) = last_info.unwrap_or((0, Eval::Cp(0)));
-        Ok(Some(SearchResult {
-            mv,
-            eval: eval.for_white(board.side_to_move()),
-            depth,
-        }))
+        let result = best
+            .filter(|mv| MoveGen::new_legal(&board).any(|m| m == *mv))
+            .map(|mv| {
+                let (depth, eval) = last.unwrap_or((0, Eval::Cp(0)));
+                SearchResult { mv, eval, depth }
+            });
+        Ok(Searched::Done(result))
     }
 }
 
-/// Parses `info ... depth D ... score cp|mate N ...`; the score is from the side to move's
-/// point of view. Lines without a score yield `None`.
-fn parse_info(line: &str) -> Option<(u32, Eval)> {
+enum Searched {
+    Done(Option<SearchResult>),
+    /// Cancelled before it started; nobody waits for an answer.
+    Cancelled,
+}
+
+/// `setoption` pairs that give Stockfish the strength of `level`.
+fn uci_level_options(level: Level) -> Vec<(&'static str, String)> {
+    match level.elo() {
+        None => vec![("UCI_LimitStrength", "false".to_string())],
+        Some(elo) => vec![
+            ("UCI_LimitStrength", "true".to_string()),
+            ("UCI_Elo", elo.to_string()),
+        ],
+    }
+}
+
+/// Parses `option name <name> type spin ... max <n>` into `(name, n)`.
+fn parse_spin_option(line: &str) -> Option<(String, u64)> {
+    let rest = line.strip_prefix("option name ")?;
+    let (name, rest) = rest.split_once(" type ")?;
+    let mut tokens = rest.split_whitespace();
+    if tokens.next()? != "spin" {
+        return None;
+    }
+    while let Some(tok) = tokens.next() {
+        if tok == "max" {
+            return Some((name.to_string(), tokens.next()?.parse().ok()?));
+        }
+    }
+    None
+}
+
+/// One parsed `info` line with a score; the score is from the side to move's point of view.
+#[derive(Debug, PartialEq, Eq)]
+struct UciInfo {
+    depth: u32,
+    eval: Eval,
+    /// `lowerbound` / `upperbound`: a provisional score.
+    bound: bool,
+    pv: Vec<String>,
+}
+
+fn parse_info(line: &str) -> Option<UciInfo> {
     let mut tokens = line.split_whitespace();
     if tokens.next()? != "info" {
         return None;
     }
     let mut depth = 0;
     let mut eval = None;
+    let mut bound = false;
+    let mut pv = Vec::new();
     while let Some(tok) = tokens.next() {
         match tok {
             "depth" => depth = tokens.next()?.parse().ok()?,
@@ -274,12 +515,37 @@ fn parse_info(line: &str) -> Option<(u32, Eval)> {
                     _ => None,
                 }
             }
+            "lowerbound" | "upperbound" => bound = true,
             // Only the move list follows `pv`.
-            "pv" => break,
+            "pv" => {
+                pv = tokens.by_ref().map(str::to_string).collect();
+            }
             _ => {}
         }
     }
-    Some((depth, eval?))
+    Some(UciInfo {
+        depth,
+        eval: eval?,
+        bound,
+        pv,
+    })
+}
+
+/// The longest legal prefix of `moves` (UCI notation) played from `board`.
+fn legal_line(board: &Board, moves: &[String]) -> Vec<ChessMove> {
+    let mut board = *board;
+    let mut line = Vec::new();
+    for text in moves {
+        let Ok(mv) = ChessMove::from_str(text) else {
+            break;
+        };
+        if !MoveGen::new_legal(&board).any(|m| m == mv) {
+            break;
+        }
+        line.push(mv);
+        board = board.make_move_new(mv);
+    }
+    line
 }
 
 /// Parses `bestmove <move> [ponder <move>]`. Outer `None`: not a bestmove line.
@@ -296,15 +562,25 @@ fn parse_bestmove(line: &str) -> Option<Option<&str>> {
 mod tests {
     use super::*;
 
+    fn mv(s: &str) -> ChessMove {
+        ChessMove::from_str(s).unwrap()
+    }
+
     #[test]
-    fn parses_info_cp_and_mate() {
-        assert_eq!(
-            parse_info("info depth 12 seldepth 18 multipv 1 score cp -34 nodes 1000 pv e2e4 e7e5"),
-            Some((12, Eval::Cp(-34)))
-        );
-        assert_eq!(
-            parse_info("info depth 20 score mate 3 pv h5f7"),
-            Some((20, Eval::Mate(3)))
+    fn parses_info_with_pv() {
+        let info =
+            parse_info("info depth 12 seldepth 18 multipv 1 score cp -34 nodes 1000 pv e2e4 e7e5")
+                .unwrap();
+        assert_eq!(info.depth, 12);
+        assert_eq!(info.eval, Eval::Cp(-34));
+        assert!(!info.bound);
+        assert_eq!(info.pv, vec!["e2e4", "e7e5"]);
+        let mate = parse_info("info depth 20 score mate 3 pv h5f7").unwrap();
+        assert_eq!(mate.eval, Eval::Mate(3));
+        assert!(
+            parse_info("info depth 9 score cp 20 lowerbound nodes 5 pv e2e4")
+                .unwrap()
+                .bound
         );
         assert_eq!(
             parse_info("info depth 5 currmove e2e4 currmovenumber 1"),
@@ -315,6 +591,50 @@ mod tests {
     }
 
     #[test]
+    fn legal_line_stops_at_first_bad_move() {
+        let moves: Vec<String> = ["e2e4", "e7e5", "e4e5", "g1f3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            legal_line(&Board::default(), &moves),
+            vec![mv("e2e4"), mv("e7e5")]
+        );
+    }
+
+    #[test]
+    fn parses_options_and_levels() {
+        assert_eq!(
+            parse_spin_option("option name Threads type spin default 1 min 1 max 1024"),
+            Some(("Threads".to_string(), 1024))
+        );
+        assert_eq!(
+            parse_spin_option("option name Move Overhead type spin default 10 min 0 max 5000"),
+            Some(("Move Overhead".to_string(), 5000))
+        );
+        assert_eq!(
+            parse_spin_option("option name Ponder type check default false"),
+            None
+        );
+
+        assert_eq!(
+            uci_level_options(Level::MAX),
+            vec![("UCI_LimitStrength", "false".to_string())]
+        );
+        assert_eq!(
+            uci_level_options(Level::new(1)),
+            vec![
+                ("UCI_LimitStrength", "true".to_string()),
+                ("UCI_Elo", "1320".to_string())
+            ]
+        );
+        assert_eq!(Level::new(0), Level::MIN);
+        assert_eq!(Level::new(99), Level::MAX);
+        assert_eq!(Level::MAX.stronger(), Level::MAX);
+        assert_eq!(Level::MIN.weaker(), Level::MIN);
+    }
+
+    #[test]
     fn parses_bestmove() {
         assert_eq!(
             parse_bestmove("bestmove e7e8q ponder a2a3"),
@@ -322,8 +642,7 @@ mod tests {
         );
         assert_eq!(parse_bestmove("bestmove (none)"), Some(None));
         assert_eq!(parse_bestmove("info depth 1 score cp 3"), None);
-        let mv = ChessMove::from_str("e7e8q").unwrap();
-        assert_eq!(mv.get_promotion(), Some(chess::Piece::Queen));
+        assert_eq!(mv("e7e8q").get_promotion(), Some(chess::Piece::Queen));
     }
 
     #[test]
@@ -336,11 +655,11 @@ mod tests {
     #[test]
     fn replay_tracks_positions() {
         let req = SearchRequest {
+            id: 0,
             root: Board::default(),
-            moves: vec![
-                ChessMove::from_str("e2e4").unwrap(),
-                ChessMove::from_str("e7e5").unwrap(),
-            ],
+            moves: vec![mv("e2e4"), mv("e7e5")],
+            level: Level::MAX,
+            limit: SearchLimit::MoveTime(Duration::from_millis(100)),
         };
         let (board, hashes) = req.replay();
         assert_eq!(hashes.len(), 2);
@@ -354,28 +673,83 @@ mod tests {
     }
 
     #[cfg(bundled_stockfish)]
-    #[test]
-    fn bundled_stockfish_plays_a_legal_move() {
-        let dir = crate::bundled::tests::temp_dir("uci");
-        let path = crate::bundled::extract_to(&dir).unwrap();
-        let engine = Engine::Uci(UciEngine::start(&path).expect("bundled Stockfish starts"));
-        assert!(
-            engine.name().starts_with("Stockfish"),
-            "name: {}",
-            engine.name()
-        );
+    mod stockfish {
+        use super::*;
 
-        let req = SearchRequest {
-            root: Board::default(),
-            moves: Vec::new(),
-        };
-        let result = engine
-            .think(req)
-            .recv_timeout(Duration::from_secs(10))
-            .expect("answer in time")
-            .expect("a move");
-        assert!(MoveGen::new_legal(&Board::default()).any(|m| m == result.mv));
-        drop(engine); // stop the process before removing its file
-        let _ = std::fs::remove_dir_all(&dir);
+        fn request(id: u64, level: Level, millis: u64) -> SearchRequest {
+            SearchRequest {
+                id,
+                root: Board::default(),
+                moves: Vec::new(),
+                level,
+                limit: SearchLimit::MoveTime(Duration::from_millis(millis)),
+            }
+        }
+
+        /// Collects events until `Done`; returns the progress seen and the result.
+        fn finish(rx: &Receiver<SearchEvent>) -> (Vec<SearchInfo>, Option<SearchResult>) {
+            let mut progress = Vec::new();
+            loop {
+                match rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("engine answers")
+                {
+                    SearchEvent::Progress(info) => progress.push(info),
+                    SearchEvent::Done { result, .. } => return (progress, result),
+                }
+            }
+        }
+
+        fn legal(mv: ChessMove) -> bool {
+            MoveGen::new_legal(&Board::default()).any(|m| m == mv)
+        }
+
+        #[test]
+        fn plays_streams_cancels_and_switches_level() {
+            let dir = crate::bundled::tests::temp_dir("uci");
+            let path = crate::bundled::extract_to(&dir).unwrap();
+            let engine = Engine::Uci(UciEngine::start(&path).expect("bundled Stockfish starts"));
+            assert!(
+                engine.name().starts_with("Stockfish"),
+                "name: {}",
+                engine.name()
+            );
+
+            // Level 1: a legal move and a streamed, legal principal variation.
+            let (progress, result) = finish(&engine.think(request(1, Level::new(1), 300)));
+            assert!(legal(result.expect("a move").mv));
+            let last = progress.last().expect("progress events");
+            assert!(legal(last.pv[0]));
+            assert_eq!(
+                legal_line(
+                    &Board::default(),
+                    &last.pv.iter().map(|m| m.to_string()).collect::<Vec<_>>()
+                ),
+                last.pv
+            );
+
+            // Cancel: a 5 s search stops almost at once.
+            let started = Instant::now();
+            let rx = engine.think(request(2, Level::MAX, 5_000));
+            thread::sleep(Duration::from_millis(200));
+            engine.cancel(2);
+            let (_, result) = finish(&rx);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "cancel took {:?}",
+                started.elapsed()
+            );
+            assert!(legal(result.expect("a move").mv));
+
+            // A queued request cancelled before it starts is skipped; the next one runs.
+            let skipped = engine.think(request(3, Level::MAX, 5_000));
+            engine.cancel(3);
+            let (_, result) = finish(&engine.think(request(4, Level::MAX, 200)));
+            assert!(legal(result.expect("a move").mv));
+            assert!(skipped.recv_timeout(Duration::from_millis(100)).is_err());
+
+            drop(engine); // stop the process before removing its file
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
