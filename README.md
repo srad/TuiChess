@@ -1,14 +1,14 @@
 <div align="center">
 
-# ♞ TuiChess
+# TuiChess
 
-**Play chess against an engine in your terminal.** It has block-art pieces, mouse support, colour themes and an evaluation bar.
+Play chess against an engine in your terminal.
 
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/)
 [![ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
-[![UCI](https://img.shields.io/badge/engine-built--in%20%7C%20UCI-2ea44f)](#-engine)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#-installation)
+[![UCI](https://img.shields.io/badge/engine-built--in%20%7C%20UCI-2ea44f)](#engine)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#installation)
 [![Last commit](https://img.shields.io/github/last-commit/srad/TuiChess)](https://github.com/srad/TuiChess/commits)
 [![Stars](https://img.shields.io/github/stars/srad/TuiChess?style=social)](https://github.com/srad/TuiChess/stargazers)
 
@@ -17,23 +17,21 @@
 
 </div>
 
----
+## Features
 
-## ✨ Features
+- Block-art pieces that scale with the terminal, with Unicode glyphs as a fallback for small windows
+- Mouse and keyboard input: click a piece and then its target, or use the arrow keys or `hjkl`
+- Play as White or Black; the board flips so your side is always at the bottom
+- Built-in engine: iterative-deepening alpha-beta search (PVS), a transposition table, quiescence search, killer moves and a tapered [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) evaluation
+- Stockfish or any other UCI engine on your `PATH` is detected and used automatically
+- Evaluation bar with the score in centipawns or moves to mate
+- Four colour themes: Wood, Forest, Ocean and Slate
+- Undo, which takes back your last move and the engine's reply
+- Move list in algebraic notation with piece symbols (`♘f3`, `Nbd2`, `O-O`, `e8=Q#`)
+- Full rules: castling, en passant, promotion, checkmate, stalemate, threefold repetition, the fifty-move rule and insufficient material
+- Highlights for the last move, legal targets, captures and check
 
-- 🎨 **Block-art pieces** that scale with the terminal, with Unicode glyphs as a fallback for small windows
-- 🖱️ **Mouse and keyboard.** Click a piece and then its target, or use the arrow keys or `hjkl`
-- 🔄 **Play as White or Black.** The board flips so that your side is always at the bottom
-- 🧠 **Built-in engine:** iterative-deepening alpha-beta search (PVS), a transposition table, quiescence search, killer moves and a tapered [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) evaluation
-- 🐟 **Stockfish support.** Any UCI engine on your `PATH` is detected and used automatically
-- 📊 **Evaluation bar** with the score in centipawns or moves to mate
-- 🌈 **Four themes:** Wood, Forest, Ocean and Slate
-- ↩️ **Undo** that takes back your last move and the engine's reply
-- 📜 **Move list in algebraic notation with piece symbols** (`♘f3`, `Nbd2`, `O-O`, `e8=Q#`)
-- ⚖️ **All the rules:** castling, en passant, promotion, checkmate, stalemate, threefold repetition, the fifty-move rule and insufficient material
-- 💡 **Highlights** for the last move, legal targets, captures and check
-
-## 📦 Installation
+## Installation
 
 You need [Rust](https://rustup.rs) 1.88 or newer.
 
@@ -50,10 +48,9 @@ cargo install --path .
 tuichess
 ```
 
-> [!TIP]
-> Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. A larger window shows larger pieces.
+Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. A larger window shows larger pieces.
 
-## 🎮 Controls
+## Controls
 
 | Key | Action |
 | --- | --- |
@@ -67,7 +64,7 @@ tuichess
 | `t` | Next colour theme |
 | `q` / `Ctrl+C` | Quit |
 
-## 🐟 Engine
+## Engine
 
 At startup, TuiChess picks an engine in this order:
 
@@ -89,7 +86,7 @@ $env:CHESS_ENGINE = "builtin"; cargo run --release
 
 The panel shows which engine is playing.
 
-## 🏗️ Project layout
+## Project layout
 
 ```
 src/
@@ -102,7 +99,7 @@ src/
 
 Move generation comes from the [`chess`](https://crates.io/crates/chess) crate, rendering from [`ratatui`](https://ratatui.rs) and terminal I/O from [`crossterm`](https://crates.io/crates/crossterm).
 
-## 🧪 Development
+## Development
 
 ```sh
 cargo test
@@ -110,7 +107,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-## 🙏 Acknowledgements
+## Acknowledgements
 
 - PeSTO piece-square tables by Ronald Friederich (Rofchade), from the [Chess Programming Wiki](https://www.chessprogramming.org)
 - [Stockfish](https://stockfishchess.org) and the UCI protocol
