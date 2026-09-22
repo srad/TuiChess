@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use chess::Color;
 
 use crate::clock::{self, TimeControl};
-use crate::engine::Level;
+use crate::engine::{EngineChoice, Level};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -18,16 +18,18 @@ pub struct Settings {
     pub level: Level,
     pub two_player: bool,
     pub clock: Option<TimeControl>,
+    pub engine: EngineChoice,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            theme: "Wood".to_string(),
+            theme: "Blue".to_string(),
             side: Color::White,
             level: Level::DEFAULT,
             two_player: false,
             clock: None,
+            engine: EngineChoice::Stockfish,
         }
     }
 }
@@ -77,6 +79,11 @@ impl Settings {
                         s.clock = preset;
                     }
                 }
+                "engine" => match value {
+                    "stockfish" => s.engine = EngineChoice::Stockfish,
+                    "builtin" => s.engine = EngineChoice::Builtin,
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -93,8 +100,12 @@ impl Settings {
         } else {
             "engine"
         };
+        let engine = match self.engine {
+            EngineChoice::Stockfish => "stockfish",
+            EngineChoice::Builtin => "builtin",
+        };
         format!(
-            "theme={}\nside={side}\nlevel={}\nmode={mode}\nclock={}\n",
+            "theme={}\nside={side}\nlevel={}\nmode={mode}\nclock={}\nengine={engine}\n",
             self.theme,
             self.level.get(),
             clock::preset_name(self.clock)
@@ -126,6 +137,7 @@ mod tests {
             level: Level::new(7),
             two_player: true,
             clock: clock::PRESETS[3],
+            engine: EngineChoice::Builtin,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
 
@@ -139,7 +151,8 @@ mod tests {
     #[test]
     fn invalid_values_fall_back_per_key() {
         let s = Settings::parse(
-            "theme=Forest\nside=purple\nlevel=99\nmode=chaos\nclock=7+7\nfoo=bar\ngarbage line\n",
+            "theme=Forest\nside=purple\nlevel=99\nmode=chaos\nclock=7+7\nengine=warp\nfoo=bar\n\
+             garbage line\n",
         );
         let d = Settings::default();
         assert_eq!(s.theme, "Forest");
@@ -147,6 +160,7 @@ mod tests {
         assert_eq!(s.level, d.level);
         assert_eq!(s.two_player, d.two_player);
         assert_eq!(s.clock, d.clock);
+        assert_eq!(s.engine, d.engine);
     }
 
     #[test]

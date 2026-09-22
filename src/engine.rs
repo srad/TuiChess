@@ -139,12 +139,32 @@ pub enum SearchEvent {
     },
 }
 
+/// The engine the player asked for; what actually runs may differ (see `Engine::start`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EngineChoice {
+    /// A UCI engine as found by `Engine::detect`, normally the bundled Stockfish.
+    Stockfish,
+    Builtin,
+}
+
 pub enum Engine {
     Builtin,
     Uci(UciEngine),
 }
 
 impl Engine {
+    /// The engine for `choice`; Stockfish falls back to the built-in engine when none starts.
+    pub fn start(choice: EngineChoice) -> Engine {
+        match choice {
+            EngineChoice::Stockfish => Engine::detect(),
+            EngineChoice::Builtin => Engine::Builtin,
+        }
+    }
+
+    pub fn is_uci(&self) -> bool {
+        matches!(self, Engine::Uci(_))
+    }
+
     /// First that works: `CHESS_ENGINE`, the bundled Stockfish, `stockfish` on PATH, built-in.
     pub fn detect() -> Engine {
         match std::env::var("CHESS_ENGINE") {

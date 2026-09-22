@@ -12,10 +12,12 @@ use crossterm::event::{
 use ratatui::layout::{Position, Rect};
 
 use crate::clock::{self, TimeControl};
-use crate::engine::{Engine, Eval, Level, SearchEvent, SearchLimit};
+use crate::engine::{Engine, EngineChoice, Eval, Level, SearchEvent, SearchLimit};
 use crate::game::{EngineMove, Game, GameSetup, Phase, StartPosition};
+use crate::menu::{self, Command, Menu};
 use crate::settings::Settings;
-use crate::ui;
+use crate::theme::{self, THEMES};
+use crate::ui::{self, MenuHit};
 
 const NOTICE_TIME: Duration = Duration::from_secs(4);
 /// Thinking time per move without a clock, and for hints.
@@ -33,7 +35,7 @@ pub enum Flow {
     Quit,
 }
 
-/// Actions that may ask for a second key press first.
+/// Actions that may ask for confirmation first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
     Resign,
@@ -46,13 +48,29 @@ enum Action {
 impl Action {
     fn prompt(self) -> &'static str {
         match self {
-            Action::Resign => "Press x again to resign",
-            Action::OfferDraw => "Press d again to offer a draw",
-            Action::Restart => "Press r again to restart",
-            Action::NewGameSwap => "Press n again for a new game",
-            Action::SwitchMode => "Press m again to switch mode",
+            Action::Resign => "Resign this game?",
+            Action::OfferDraw => "Offer a draw?",
+            Action::Restart => "Abandon this game and restart?",
+            Action::NewGameSwap => "Swap sides and start a new game?",
+            Action::SwitchMode => "Switch mode and start a new game?",
         }
     }
+}
+
+/// What sits on top of the game and takes the input first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Overlay {
+    Help,
+    About,
+    /// `yes`: whether the Yes button has the focus.
+    Confirm {
+        action: Action,
+        yes: bool,
+    },
+    Menu {
+        menu: usize,
+        item: usize,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,11 +116,10 @@ pub struct App {
     version: u64,
     browse: Option<usize>,
     drag: Drag,
-    confirm: Option<(Action, Instant)>,
+    overlay: Option<Overlay>,
     notice: Option<Notice>,
     engine_failed: bool,
     last_restart: Option<Instant>,
-    help_open: bool,
     /// The engine's expected line and the position it starts from.
     engine_line: Option<(Board, Vec<ChessMove>)>,
     tick: u64,
@@ -137,6 +154,16 @@ fn engine_accepts_draw(eval: Option<Eval>, engine: Color) -> bool {
     }
 }
 
+/// Alt without Ctrl: AltGr arrives as Ctrl+Alt and must type its character instead.
+fn is_alt(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn menu_for_key(menus: &[Menu], c: char) -> Option<usize> {
+    let c = c.to_ascii_lowercase();
+    menus.iter().position(|m| m.key == c)
+}
+
 impl App {
     pub fn new(
         engine: Engine,
@@ -161,11 +188,10 @@ impl App {
             version: 0,
             browse: None,
             drag: Drag::default(),
-            confirm: None,
+            overlay: None,
             notice: None,
             engine_failed: false,
             last_restart: None,
-            help_open: false,
             engine_line: None,
             tick: 0,
         };
@@ -232,6 +258,18 @@ impl App {
         !self.game.history.is_empty() && !self.game.game_over()
     }
 
+    fn promoting(&self) -> bool {
+        matches!(self.game.phase, Phase::Promoting { .. })
+    }
+
+    fn menus(&self) -> Vec<Menu> {
+        menu::build(menu::Context {
+            settings: &self.settings,
+            uci: self.engine.is_uci(),
+            engine_name: self.engine.name(),
+        })
+    }
+
     // ----- time-driven work -------------------------------------------------------------
 
     pub fn tick(&mut self, now: Instant) {
@@ -243,9 +281,6 @@ impl App {
             .is_some_and(|until| now >= until)
         {
             self.notice = None;
-        }
-        if self.confirm.is_some_and(|(_, until)| now >= until) {
-            self.confirm = None;
         }
 
         // 1. Search events; an engine move is judged at the time the engine answered.
@@ -340,7 +375,7 @@ impl App {
         self.engine = if unstable {
             Engine::Builtin
         } else {
-            Engine::detect()
+            Engine::start(self.settings.engine)
         };
         self.last_restart = Some(now);
         let text = if unstable {
@@ -379,6 +414,56 @@ impl App {
         });
     }
 
+    // ----- commands (keys and menus) ----------------------------------------------------
+
+    fn run(&mut self, command: Command, now: Instant) -> Flow {
+        match command {
+            Command::Restart => self.request(Action::Restart, now),
+            Command::SwapSides => self.request(Action::NewGameSwap, now),
+            Command::Mode { two_player } => {
+                if two_player != self.settings.two_player {
+                    self.request(Action::SwitchMode, now);
+                }
+            }
+            Command::Resign => self.request(Action::Resign, now),
+            Command::OfferDraw => self.request(Action::OfferDraw, now),
+            Command::Undo => self.undo(now),
+            Command::Hint => self.hint(now),
+            Command::Flip => self.game.orientation = !self.game.orientation,
+            Command::Level(level) => self.change_level(level, now),
+            Command::Clock(preset) => self.set_clock(preset, now),
+            Command::Engine(choice) => self.switch_engine(choice, now),
+            Command::Theme(index) => self.set_theme(index, now),
+            Command::Keys => self.overlay = Some(Overlay::Help),
+            Command::About => self.overlay = Some(Overlay::About),
+            Command::Quit => return Flow::Quit,
+        }
+        Flow::Continue
+    }
+
+    /// The command for a key pressed with no overlay open.
+    fn key_command(&self, c: char) -> Option<Command> {
+        let command = match c.to_ascii_lowercase() {
+            'q' => Command::Quit,
+            'u' => Command::Undo,
+            'r' => Command::Restart,
+            'n' => Command::SwapSides,
+            'm' => Command::Mode {
+                two_player: !self.settings.two_player,
+            },
+            'x' => Command::Resign,
+            'd' => Command::OfferDraw,
+            'f' => Command::Flip,
+            's' => Command::Hint,
+            '+' | '=' => Command::Level(self.settings.level.stronger()),
+            '-' => Command::Level(self.settings.level.weaker()),
+            'c' => Command::Clock(clock::next_preset(self.settings.clock)),
+            't' => Command::Theme((theme::theme_index(&self.settings.theme) + 1) % THEMES.len()),
+            _ => return None,
+        };
+        Some(command)
+    }
+
     // ----- keyboard ---------------------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent, now: Instant) -> Flow {
@@ -388,18 +473,35 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Flow::Quit;
         }
-        if self.help_open {
-            self.help_open = false;
+        match self.overlay {
+            Some(Overlay::Help | Overlay::About) => {
+                self.overlay = None;
+                return Flow::Continue;
+            }
+            Some(Overlay::Confirm { action, yes }) => {
+                self.confirm_key(key.code, action, yes, now);
+                return Flow::Continue;
+            }
+            Some(Overlay::Menu { menu, item }) => return self.menu_key(key, menu, item, now),
+            None => {}
+        }
+
+        if key.code == KeyCode::F(10) || is_alt(&key) {
+            if !self.promoting() {
+                let menus = self.menus();
+                let menu = match key.code {
+                    KeyCode::F(10) => Some(0),
+                    KeyCode::Char(c) => menu_for_key(&menus, c),
+                    _ => None,
+                };
+                if let Some(menu) = menu {
+                    self.open_menu(&menus, menu);
+                }
+            }
             return Flow::Continue;
         }
-        // A pending confirmation only survives the matching key.
-        let confirming = self
-            .confirm
-            .take()
-            .filter(|&(_, until)| now < until)
-            .map(|(action, _)| action);
 
-        if matches!(self.game.phase, Phase::Promoting { .. }) {
+        if self.promoting() {
             match key.code {
                 KeyCode::Char(c) => {
                     if let Some(piece) = promotion_piece(c)
@@ -433,34 +535,92 @@ impl App {
                     self.after_move();
                 }
             }
-            KeyCode::F(1) | KeyCode::Char('?') => self.help_open = true,
+            KeyCode::F(1) | KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
             KeyCode::Home => {
                 if !self.game.history.is_empty() {
                     self.browse = Some(0);
                 }
             }
             KeyCode::End => self.browse = None,
-            KeyCode::Char(c) => match c.to_ascii_lowercase() {
-                'q' => return Flow::Quit,
-                'u' => self.undo(now),
-                'r' => self.request(Action::Restart, confirming, now),
-                'n' => self.request(Action::NewGameSwap, confirming, now),
-                'm' => self.request(Action::SwitchMode, confirming, now),
-                'x' => self.request(Action::Resign, confirming, now),
-                'd' => self.request(Action::OfferDraw, confirming, now),
-                'f' => self.game.orientation = !self.game.orientation,
-                '+' | '=' => self.change_level(self.settings.level.stronger(), now),
-                '-' => self.change_level(self.settings.level.weaker(), now),
-                's' => self.hint(now),
-                'c' => self.cycle_clock(now),
-                't' => self.cycle_theme(now),
-                ',' => self.browse_back(),
-                '.' => self.browse_forward(),
-                _ => {}
-            },
+            KeyCode::Char(',') => self.browse_back(),
+            KeyCode::Char('.') => self.browse_forward(),
+            KeyCode::Char(c) => {
+                if let Some(command) = self.key_command(c) {
+                    return self.run(command, now);
+                }
+            }
             _ => {}
         }
         Flow::Continue
+    }
+
+    fn confirm_key(&mut self, code: KeyCode, action: Action, yes: bool, now: Instant) {
+        let answer = match code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'y') => Some(true),
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'n') => Some(false),
+            KeyCode::Esc => Some(false),
+            KeyCode::Enter => Some(yes),
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                self.overlay = Some(Overlay::Confirm { action, yes: !yes });
+                None
+            }
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            self.answer(action, answer, now);
+        }
+    }
+
+    fn answer(&mut self, action: Action, yes: bool, now: Instant) {
+        self.overlay = None;
+        if yes {
+            self.perform(action, now);
+        }
+    }
+
+    fn open_menu(&mut self, menus: &[Menu], menu: usize) {
+        self.overlay = Some(Overlay::Menu {
+            menu,
+            item: menus[menu].initial_item(),
+        });
+    }
+
+    fn menu_key(&mut self, key: KeyEvent, menu: usize, item: usize, now: Instant) -> Flow {
+        let menus = self.menus();
+        let count = menus.len();
+        let items = &menus[menu].items;
+        match key.code {
+            KeyCode::Esc | KeyCode::F(10) => self.overlay = None,
+            KeyCode::Left => self.open_menu(&menus, (menu + count - 1) % count),
+            KeyCode::Right => self.open_menu(&menus, (menu + 1) % count),
+            KeyCode::Up => {
+                let item = (item + items.len() - 1) % items.len();
+                self.overlay = Some(Overlay::Menu { menu, item });
+            }
+            KeyCode::Down => {
+                let item = (item + 1) % items.len();
+                self.overlay = Some(Overlay::Menu { menu, item });
+            }
+            KeyCode::Enter => return self.choose(items[item].command, now),
+            KeyCode::Char(c) if is_alt(&key) => {
+                if let Some(other) = menu_for_key(&menus, c) {
+                    self.open_menu(&menus, other);
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(i) = menus[menu].item_for_key(c) {
+                    return self.choose(items[i].command, now);
+                }
+            }
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    /// Closes the menu and runs the chosen item.
+    fn choose(&mut self, command: Command, now: Instant) -> Flow {
+        self.overlay = None;
+        self.run(command, now)
     }
 
     fn cursor(&mut self, df: i8, dr: i8) {
@@ -468,7 +628,8 @@ impl App {
         self.game.move_cursor(df, dr);
     }
 
-    fn request(&mut self, action: Action, confirming: Option<Action>, now: Instant) {
+    /// Asks first where an action would end or abandon a game.
+    fn request(&mut self, action: Action, now: Instant) {
         let needs_confirm = match action {
             Action::Resign | Action::OfferDraw => {
                 if self.game.game_over() {
@@ -479,12 +640,20 @@ impl App {
             }
             Action::Restart | Action::NewGameSwap | Action::SwitchMode => self.game_in_progress(),
         };
-        if needs_confirm && confirming != Some(action) {
-            self.confirm = Some((action, now + NOTICE_TIME));
-            self.set_notice(action.prompt(), now);
+        if needs_confirm {
+            self.overlay = Some(Overlay::Confirm { action, yes: false });
+        } else {
+            self.perform(action, now);
+        }
+    }
+
+    fn perform(&mut self, action: Action, now: Instant) {
+        self.notice = None;
+        // The game may have ended while the question was open.
+        if matches!(action, Action::Resign | Action::OfferDraw) && self.game.game_over() {
+            self.set_notice("The game is over", now);
             return;
         }
-        self.notice = None;
         match action {
             Action::Restart => self.new_game(),
             Action::NewGameSwap => {
@@ -566,8 +735,8 @@ impl App {
         self.set_notice(format!("Level {}/8{strength}{scope}", level.get()), now);
     }
 
-    fn cycle_clock(&mut self, now: Instant) {
-        self.settings.clock = clock::next_preset(self.settings.clock);
+    fn set_clock(&mut self, preset: Option<TimeControl>, now: Instant) {
+        self.settings.clock = preset;
         self.save_settings(now);
         let text = format!(
             "Clock {} next game",
@@ -576,9 +745,35 @@ impl App {
         self.set_notice(text, now);
     }
 
-    fn cycle_theme(&mut self, now: Instant) {
-        let next = (ui::theme_index(&self.settings.theme) + 1) % ui::THEMES.len();
-        self.settings.theme = ui::THEMES[next].name.to_string();
+    fn set_theme(&mut self, index: usize, now: Instant) {
+        if let Some(theme) = THEMES.get(index) {
+            self.settings.theme = theme.name.to_string();
+            self.save_settings(now);
+        }
+    }
+
+    /// Starts the chosen engine unless it already runs; a running search is dropped.
+    fn switch_engine(&mut self, choice: EngineChoice, now: Instant) {
+        self.settings.engine = choice;
+        let running = if self.engine.is_uci() {
+            EngineChoice::Stockfish
+        } else {
+            EngineChoice::Builtin
+        };
+        if running != choice {
+            self.drop_pending(); // on the old engine
+            self.version += 1;
+            self.engine = Engine::start(choice);
+            self.engine_failed = false;
+            self.engine_line = None;
+            self.last_restart = None;
+        }
+        let text = if choice == EngineChoice::Stockfish && !self.engine.is_uci() {
+            "Stockfish not available: built-in engine".to_string()
+        } else {
+            format!("Engine: {}", self.engine.name())
+        };
+        self.set_notice(text, now);
         self.save_settings(now);
     }
 
@@ -606,7 +801,7 @@ impl App {
             y: event.row,
         };
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(pos, area, now),
+            MouseEventKind::Down(MouseButton::Left) => return self.mouse_down(pos, area, now),
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.drag.from.is_some()
                     && let Some(sq) = ui::square_at(area, self.game.orientation, pos)
@@ -620,27 +815,57 @@ impl App {
         Flow::Continue
     }
 
-    fn mouse_down(&mut self, pos: Position, area: Rect, now: Instant) {
+    fn mouse_down(&mut self, pos: Position, area: Rect, now: Instant) -> Flow {
         self.drag = Drag::default(); // a lost Up never leaves a stale drag
-        self.confirm = None;
-        if self.help_open {
-            self.help_open = false;
-            return;
+        match self.overlay {
+            Some(Overlay::Help | Overlay::About) => {
+                self.overlay = None;
+                return Flow::Continue;
+            }
+            Some(Overlay::Confirm { action, .. }) => {
+                if let Some(yes) = ui::confirm_button_at(area, pos) {
+                    self.answer(action, yes, now);
+                }
+                return Flow::Continue;
+            }
+            Some(Overlay::Menu { menu, .. }) => {
+                let menus = self.menus();
+                if let Some(title) = ui::menu_title_at(area, &menus, pos) {
+                    if title == menu {
+                        self.overlay = None;
+                    } else {
+                        self.open_menu(&menus, title);
+                    }
+                    return Flow::Continue;
+                }
+                match ui::menu_item_at(area, &menus, menu, pos) {
+                    MenuHit::Item(i) => return self.choose(menus[menu].items[i].command, now),
+                    MenuHit::Inside => {}
+                    MenuHit::Outside => self.overlay = None,
+                }
+                return Flow::Continue;
+            }
+            None => {}
         }
-        if matches!(self.game.phase, Phase::Promoting { .. }) {
+        if self.promoting() {
             if let Some(piece) = ui::promotion_choice_at(area, pos)
                 && self.game.promote(piece, now)
             {
                 self.after_move();
             }
-            return;
+            return Flow::Continue;
+        }
+        let menus = self.menus();
+        if let Some(title) = ui::menu_title_at(area, &menus, pos) {
+            self.open_menu(&menus, title);
+            return Flow::Continue;
         }
         if self.browse.is_some() {
             self.browse = None;
-            return;
+            return Flow::Continue;
         }
         let Some(sq) = ui::square_at(area, self.game.orientation, pos) else {
-            return;
+            return Flow::Continue;
         };
         self.game.set_cursor(sq);
         if self.game.phase == Phase::Selected(sq) {
@@ -654,6 +879,7 @@ impl App {
         } else if self.game.phase == Phase::Selected(sq) {
             self.drag.from = Some(sq);
         }
+        Flow::Continue
     }
 
     fn mouse_up(&mut self, pos: Position, area: Rect, now: Instant) {
@@ -681,7 +907,7 @@ impl App {
 
     pub fn view(&self, now: Instant) -> ui::View<'_> {
         ui::View {
-            theme: &ui::THEMES[ui::theme_index(&self.settings.theme)],
+            theme: &THEMES[theme::theme_index(&self.settings.theme)],
             tick: self.tick,
             now,
             thinking: self.pending.as_ref().map(|p| match p.purpose {
@@ -693,7 +919,16 @@ impl App {
             browse: self.browse,
             next_clock: (self.settings.clock != self.game_clock).then_some(self.settings.clock),
             notice: self.notice.as_ref().map(|n| n.text.as_str()),
-            help_open: self.help_open,
+            overlay: self.overlay.map(|overlay| match overlay {
+                Overlay::Help => ui::Overlay::Help,
+                Overlay::About => ui::Overlay::About,
+                Overlay::Confirm { action, yes } => ui::Overlay::Confirm {
+                    question: action.prompt(),
+                    yes,
+                },
+                Overlay::Menu { menu, item } => ui::Overlay::Menu { menu, item },
+            }),
+            menus: self.menus(),
             engine_line: self
                 .engine_line
                 .as_ref()
@@ -713,16 +948,20 @@ mod tests {
         App::new(Engine::Builtin, settings, None, StartPosition::default())
     }
 
-    fn press(app: &mut App, code: KeyCode, now: Instant) -> Flow {
+    fn press_with(app: &mut App, code: KeyCode, modifiers: KeyModifiers, now: Instant) -> Flow {
         app.on_key(
             KeyEvent {
                 code,
-                modifiers: KeyModifiers::NONE,
+                modifiers,
                 kind: KeyEventKind::Press,
                 state: KeyEventState::NONE,
             },
             now,
         )
+    }
+
+    fn press(app: &mut App, code: KeyCode, now: Instant) -> Flow {
+        press_with(app, code, KeyModifiers::NONE, now)
     }
 
     fn keys(app: &mut App, text: &str, now: Instant) {
@@ -737,6 +976,30 @@ mod tests {
         width: 100,
         height: 40,
     };
+
+    fn click_at(app: &mut App, pos: Position, now: Instant) -> Flow {
+        let flow = app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: pos.x,
+                row: pos.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            AREA,
+            now,
+        );
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: pos.x,
+                row: pos.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            AREA,
+            now,
+        );
+        flow
+    }
 
     fn mouse(app: &mut App, kind: MouseEventKind, sq: Square, now: Instant) {
         let pos = ui::square_center(AREA, app.game.orientation, sq);
@@ -765,20 +1028,39 @@ mod tests {
         })
     }
 
+    fn open_menu_item(app: &App) -> Option<(usize, usize)> {
+        match app.overlay {
+            Some(Overlay::Menu { menu, item }) => Some((menu, item)),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn resign_needs_a_second_press() {
+    fn resign_asks_first() {
         let t0 = Instant::now();
         let mut a = two_player_app();
         keys(&mut a, "x", t0);
         assert!(!a.game.game_over());
-        keys(&mut a, "t", t0); // another key cancels
+        assert_eq!(
+            a.view(t0).overlay,
+            Some(ui::Overlay::Confirm {
+                question: "Resign this game?",
+                yes: false
+            })
+        );
+        press(&mut a, KeyCode::Enter, t0); // No has the focus
+        assert!(!a.game.game_over());
+        assert_eq!(a.overlay, None);
         keys(&mut a, "x", t0);
+        press(&mut a, KeyCode::Esc, t0);
         assert!(!a.game.game_over());
-        a.tick(t0 + Duration::from_secs(5)); // expires
-        keys(&mut a, "x", t0 + Duration::from_secs(5));
-        assert!(!a.game.game_over());
-        keys(&mut a, "x", t0 + Duration::from_secs(6));
+        keys(&mut a, "x", t0);
+        press(&mut a, KeyCode::Left, t0);
+        press(&mut a, KeyCode::Enter, t0);
         assert!(a.game.status_text().contains("resigns"));
+        keys(&mut a, "x", t0);
+        assert_eq!(a.overlay, None, "no question once the game is over");
+        assert_eq!(a.view(t0).notice, Some("The game is over"));
     }
 
     #[test]
@@ -794,7 +1076,7 @@ mod tests {
         assert_eq!(a.game.history.len(), 1);
         keys(&mut a, "r", t0);
         assert_eq!(a.game.history.len(), 1, "first press only asks");
-        keys(&mut a, "r", t0);
+        keys(&mut a, "y", t0);
         assert!(a.game.history.is_empty());
     }
 
@@ -802,17 +1084,41 @@ mod tests {
     fn draw_offer_depends_on_engine_eval() {
         let t0 = Instant::now();
         let mut a = app(Settings::default()); // engine plays Black
-        keys(&mut a, "dd", t0);
+        keys(&mut a, "dy", t0);
         assert!(!a.game.game_over(), "no eval yet: declined");
         a.game.eval = Some(Eval::Cp(-200)); // Black (engine) is 2 pawns up
-        keys(&mut a, "dd", t0);
+        keys(&mut a, "dy", t0);
         assert!(!a.game.game_over());
         a.game.eval = Some(Eval::Cp(10));
-        keys(&mut a, "dd", t0);
+        keys(&mut a, "dy", t0);
         assert_eq!(a.game.status_text(), "Draw agreed.");
 
         assert!(engine_accepts_draw(Some(Eval::Mate(3)), Color::Black));
         assert!(!engine_accepts_draw(Some(Eval::Mate(3)), Color::White));
+    }
+
+    #[test]
+    fn confirm_dialog_by_mouse() {
+        let t0 = Instant::now();
+        let mut a = two_player_app();
+        keys(&mut a, "x", t0);
+        let no = ui::Overlay::Confirm {
+            question: "Resign this game?",
+            yes: false,
+        };
+        assert_eq!(a.view(t0).overlay, Some(no));
+        click_at(&mut a, Position { x: 0, y: 20 }, t0);
+        assert_eq!(
+            a.view(t0).overlay,
+            Some(no),
+            "clicks beside the buttons do nothing"
+        );
+        let yes = (0..AREA.width)
+            .flat_map(|x| (0..AREA.height).map(move |y| Position { x, y }))
+            .find(|&p| ui::confirm_button_at(AREA, p) == Some(true))
+            .unwrap();
+        click_at(&mut a, yes, t0);
+        assert!(a.game.status_text().contains("resigns"));
     }
 
     #[test]
@@ -825,7 +1131,7 @@ mod tests {
         assert_eq!(a.game.history.len(), 1, "c never resets the game");
         assert!(a.game.clock.is_none());
         assert_eq!(a.view(t0).next_clock, Some(clock::PRESETS[1]));
-        keys(&mut a, "rr", t0);
+        keys(&mut a, "ry", t0);
         assert!(a.game.clock.is_some());
         assert_eq!(a.view(t0).next_clock, None);
     }
@@ -866,10 +1172,137 @@ mod tests {
         let t0 = Instant::now();
         let mut a = two_player_app();
         keys(&mut a, "?", t0);
-        assert!(a.help_open);
+        assert_eq!(a.overlay, Some(Overlay::Help));
         assert_eq!(press(&mut a, KeyCode::Char('q'), t0), Flow::Continue);
-        assert!(!a.help_open);
+        assert_eq!(a.overlay, None);
         assert_eq!(press(&mut a, KeyCode::Char('q'), t0), Flow::Quit);
+    }
+
+    #[test]
+    fn menu_by_keyboard() {
+        let t0 = Instant::now();
+        let mut a = two_player_app();
+        press(&mut a, KeyCode::F(10), t0);
+        assert_eq!(open_menu_item(&a), Some((0, 0)));
+        for _ in 0..4 {
+            press(&mut a, KeyCode::Right, t0);
+        }
+        assert_eq!(
+            open_menu_item(&a),
+            Some((4, 0)),
+            "Theme, on the current one"
+        );
+        press(&mut a, KeyCode::Down, t0);
+        press(&mut a, KeyCode::Enter, t0);
+        assert_eq!(a.settings.theme, "Black");
+        assert_eq!(a.overlay, None);
+
+        press_with(&mut a, KeyCode::Char('l'), KeyModifiers::ALT, t0);
+        assert_eq!(open_menu_item(&a), Some((1, 3)), "Level, on level 4");
+        keys(&mut a, "8", t0);
+        assert_eq!(a.settings.level, Level::new(8));
+
+        press_with(&mut a, KeyCode::Char('l'), KeyModifiers::ALT, t0);
+        assert_eq!(press(&mut a, KeyCode::Char('q'), t0), Flow::Continue);
+        assert!(
+            open_menu_item(&a).is_some(),
+            "q is no key in the Level menu"
+        );
+        press_with(&mut a, KeyCode::Char('g'), KeyModifiers::ALT, t0);
+        assert_eq!(open_menu_item(&a), Some((0, 0)));
+        press(&mut a, KeyCode::Up, t0);
+        assert_eq!(open_menu_item(&a), Some((0, 9)), "wraps to Quit");
+        press(&mut a, KeyCode::Esc, t0);
+        assert_eq!(a.overlay, None);
+        assert_eq!(press(&mut a, KeyCode::Char('q'), t0), Flow::Quit);
+    }
+
+    #[test]
+    fn alt_keys_never_reach_the_game() {
+        let t0 = Instant::now();
+        let mut a = two_player_app();
+        click(&mut a, Square::E2, t0);
+        click(&mut a, Square::E4, t0);
+        press_with(&mut a, KeyCode::Char('x'), KeyModifiers::ALT, t0);
+        assert_eq!(a.overlay, None);
+        // AltGr arrives as Ctrl+Alt; it types a character and opens no menu.
+        press_with(
+            &mut a,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            t0,
+        );
+        assert_eq!(a.overlay, None);
+    }
+
+    #[test]
+    fn menu_by_mouse() {
+        let t0 = Instant::now();
+        let mut a = two_player_app();
+        let menus = a.menus();
+        let title = |i: usize| {
+            (0..AREA.width)
+                .map(|x| Position { x, y: 0 })
+                .find(|&p| ui::menu_title_at(AREA, &menus, p) == Some(i))
+                .unwrap()
+        };
+        let item = |menu: usize, i: usize| {
+            (0..AREA.width)
+                .flat_map(|x| (0..AREA.height).map(move |y| Position { x, y }))
+                .find(|&p| ui::menu_item_at(AREA, &menus, menu, p) == MenuHit::Item(i))
+                .unwrap()
+        };
+        click_at(&mut a, title(4), t0);
+        assert_eq!(open_menu_item(&a), Some((4, 0)));
+        click_at(&mut a, item(4, 2), t0);
+        assert_eq!(a.settings.theme, "Mono");
+
+        click_at(&mut a, title(0), t0);
+        click_at(&mut a, title(0), t0);
+        assert_eq!(a.overlay, None, "the title closes its own menu");
+        click_at(&mut a, title(0), t0);
+        click_at(
+            &mut a,
+            ui::square_center(AREA, Color::White, Square::E2),
+            t0,
+        );
+        assert_eq!(a.overlay, None);
+        assert_eq!(a.game.phase, Phase::Idle, "the click only closed the menu");
+        click_at(&mut a, title(0), t0);
+        assert_eq!(click_at(&mut a, item(0, 9), t0), Flow::Quit);
+    }
+
+    #[test]
+    fn mode_from_the_menu_asks_during_a_game() {
+        let t0 = Instant::now();
+        let mut a = two_player_app();
+        assert_eq!(
+            a.run(Command::Mode { two_player: true }, t0),
+            Flow::Continue
+        );
+        assert!(a.settings.two_player, "already two players: nothing");
+        click(&mut a, Square::E2, t0);
+        click(&mut a, Square::E4, t0);
+        a.run(Command::Mode { two_player: false }, t0);
+        assert!(matches!(a.overlay, Some(Overlay::Confirm { .. })));
+        keys(&mut a, "y", t0);
+        assert!(!a.settings.two_player);
+        assert!(a.game.history.is_empty());
+    }
+
+    #[test]
+    fn engine_choice_is_stored_and_the_menu_shows_the_running_engine() {
+        let t0 = Instant::now();
+        let mut a = two_player_app();
+        a.run(Command::Engine(EngineChoice::Builtin), t0);
+        assert_eq!(a.settings.engine, EngineChoice::Builtin);
+        assert!(matches!(a.engine, Engine::Builtin));
+        assert_eq!(a.view(t0).notice, Some("Engine: built-in"));
+        let engine_menu = &a.menus()[3];
+        assert_eq!(
+            engine_menu.items[engine_menu.initial_item()].label,
+            "Built-in"
+        );
     }
 
     #[test]
@@ -962,6 +1395,8 @@ mod tests {
             t0,
         );
         assert!(matches!(a.game.phase, Phase::Promoting { .. }));
+        press(&mut a, KeyCode::F(10), t0);
+        assert_eq!(a.overlay, None, "no menus while promoting");
         let knight = ui::promotion_cell(AREA, Piece::Knight);
         a.on_mouse(
             MouseEvent {

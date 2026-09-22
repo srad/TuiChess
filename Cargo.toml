@@ -3,6 +3,7 @@ name = "tuichess"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+authors = ["Saman Sedighi Rad"]
 description = "Terminal chess against a bundled Stockfish or a built-in engine"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/srad/TuiChess"

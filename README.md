@@ -4,6 +4,8 @@
 
 Play chess against an engine in your terminal.
 
+By Saman Sedighi Rad
+
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/)
 [![ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
@@ -18,6 +20,8 @@ Play chess against an engine in your terminal.
 
 ## Features
 
+- MS-DOS look: menu bar, blue desktop, single-line boxes and dialogs with drop shadows
+- Menus for the game, level, clock, engine, theme and help, by keyboard (`F10`, `Alt`+letter) or mouse
 - Block-art pieces that scale with the terminal, with Unicode glyphs as a fallback for small windows
 - Mouse and keyboard input: click or drag pieces, or use the arrow keys or `hjkl`
 - Play as White or Black against the engine, or two players on one machine
@@ -32,8 +36,8 @@ Play chess against an engine in your terminal.
 - Undo, which takes back your last move and the engine's reply
 - Move list in algebraic notation with piece symbols (`♘f3`, `Nbd2`, `O-O`, `e8=Q#`)
 - Full rules: castling, en passant, promotion, checkmate, stalemate, threefold repetition, the fifty-move rule and insufficient material
-- Four colour themes: Wood, Forest, Ocean and Slate
-- Settings (theme, side, level, mode, clock) are remembered between runs
+- Three colour schemes in the 16-colour VGA palette: Blue, Black and Mono
+- Settings (theme, side, level, mode, clock, engine) are remembered between runs
 - Fallback engine written in Rust: iterative-deepening alpha-beta search (PVS), a transposition table, quiescence search, killer moves and a tapered [PeSTO](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) evaluation
 - Any other UCI engine can be used instead
 
@@ -64,7 +68,7 @@ STOCKFISH_ARCHIVE=/path/to/stockfish-linux-x86-64-universal.tar.gz cargo build -
 
 Stockfish is bundled for Windows (x86-64, ARM64), Linux with glibc (x86-64, ARM64) and macOS. On other targets the game builds with the Rust engine only.
 
-Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. A larger window shows larger pieces.
+Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. The window needs at least 79x29 characters; a larger window shows larger pieces.
 
 ## Usage
 
@@ -82,6 +86,7 @@ tuichess --help
 | `Enter` / left click | Select a piece, then its target |
 | Drag with the mouse | Move a piece |
 | `Esc` | Cancel the selection |
+| `F10` / `Alt`+letter / click | Open a menu (Game, Level, Clock, Engine, Theme, Help) |
 | `Q` `R` `B` `N` or click | Choose the promotion piece |
 | `u` | Undo |
 | `r` | Restart |
@@ -91,15 +96,17 @@ tuichess --help
 | `+` / `-` | Stronger / weaker engine |
 | `s` | Suggest a move |
 | `c` | Clock for the next game (off, 1+0, 3+2, 5+3, 10+5, 15+10) |
-| `x` | Resign (press twice) |
-| `d` | Offer a draw (press twice) |
+| `x` | Resign |
+| `d` | Offer a draw |
 | `,` / `.` | Step back / forward through the game |
 | `Home` / `End` | First / current position |
 | `t` | Next colour theme |
 | `?` / `F1` | Show all keys |
 | `q` / `Ctrl+C` | Quit |
 
-`r`, `n` and `m` ask for a second press while a game is in progress.
+Resigning and offering a draw ask for confirmation in a dialog, and so do `r`, `n` and `m` while a game is in progress. Answer with `Y` or `N`, or move the focus with the arrow keys and press `Enter`. The focus starts on No.
+
+In an open menu, the arrow keys move between menus and items, `Enter` or an item's highlighted letter chooses it, and `Esc` closes the menu.
 
 ## Difficulty and clocks
 
@@ -107,11 +114,11 @@ Levels 1 to 7 limit Stockfish to about 1320, 1500, 1700, 1900, 2100, 2400 and 28
 
 The clock starts after the first move. Running out of time loses, unless the opponent has only a king, or a king and one minor piece, which is a draw.
 
-Theme, side, level, mode and clock are saved in `settings.txt` in your config directory (`%APPDATA%\TuiChess` on Windows, `~/Library/Application Support/TuiChess` on macOS, `~/.config/TuiChess` on Linux). The help screen (`?`) shows the exact path.
+Theme, side, level, mode, clock and engine are saved in `settings.txt` in your config directory (`%APPDATA%\TuiChess` on Windows, `~/Library/Application Support/TuiChess` on macOS, `~/.config/TuiChess` on Linux). Help > About shows the exact path.
 
 ## Engine
 
-At startup, TuiChess picks the first engine that works:
+Choose Stockfish or the built-in engine in the Engine menu; the choice is saved. When Stockfish is chosen, TuiChess picks the first engine that works:
 
 1. `CHESS_ENGINE=<path>`: any UCI engine binary
 2. The bundled Stockfish 19. On first start it is written to your user cache directory (`%LOCALAPPDATA%\TuiChess` on Windows, `~/Library/Caches/TuiChess` on macOS, `~/.cache/TuiChess` on Linux) and reused after that.
@@ -132,7 +139,7 @@ CHESS_ENGINE=builtin cargo run --release
 $env:CHESS_ENGINE = "builtin"; cargo run --release
 ```
 
-The panel shows which engine is playing.
+The menu bar shows which engine is playing.
 
 ## Project layout
 
@@ -143,10 +150,12 @@ src/
 ├── game.rs     # game state, rules, draw detection, notation, undo, results
 ├── clock.rs    # time controls and the chess clock
 ├── settings.rs # remembered preferences
+├── menu.rs     # menu bar contents and commands
+├── theme.rs    # colour schemes in the VGA palette
 ├── ai.rs       # Rust engine: search and PeSTO evaluation
 ├── engine.rs   # engine selection, levels and UCI protocol
 ├── bundled.rs  # embedded Stockfish binary and its extraction
-└── ui.rs       # board, panel, popups, themes (ratatui)
+└── ui.rs       # menu and status bars, board, panel, dialogs (ratatui)
 build.rs        # downloads, verifies and extracts Stockfish at build time
 ```
 
@@ -167,6 +176,8 @@ cargo fmt --check
 - Stockfish's neural networks are trained on data from the [Leela Chess Zero project](https://storage.lczero.org/files/training_data), made available under the [Open Database License](https://opendatacommons.org/licenses/odbl/odbl-10.txt)
 
 ## License
+
+Copyright (C) 2026 Saman Sedighi Rad
 
 TuiChess is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed WITHOUT ANY WARRANTY; see [LICENSE](LICENSE) for details.
 

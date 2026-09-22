@@ -5,7 +5,9 @@ mod bundled;
 mod clock;
 mod engine;
 mod game;
+mod menu;
 mod settings;
+mod theme;
 mod ui;
 
 use std::io;
@@ -38,7 +40,7 @@ Options:
 Environment:
   CHESS_ENGINE  path to a UCI engine to use instead, or `builtin`
 
-In the game, press ? for the keys.";
+In the game, press F10 for the menu or ? for the keys.";
 
 /// What the command line asks for.
 enum Command {
@@ -114,7 +116,8 @@ fn play(start: StartPosition) -> io::Result<()> {
         .as_deref()
         .map_or_else(Settings::default, Settings::load);
     println!("Starting engine…"); // the first start unpacks ~100 MB; the alt screen hides this after
-    let mut app = App::new(Engine::detect(), settings, settings_path, start);
+    let engine = Engine::start(settings.engine);
+    let mut app = App::new(engine, settings, settings_path, start);
 
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;

@@ -3,15 +3,18 @@ use std::time::{Duration, Instant};
 use chess::{ALL_SQUARES, Board, ChessMove, Color, EMPTY, File, Piece, Rank, Square};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Position, Rect},
-    style::{Color as TColor, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::clock::{self, TimeControl};
 use crate::engine::{Eval, Level};
 use crate::game::{Game, Phase, captured_pieces, material, piece_letter, san};
+use crate::menu::Menu;
+use crate::theme::{self, BoardColors, Chrome, Theme};
 
 const PANEL_W: u16 = 26;
 const ART_W: u16 = 7;
@@ -19,99 +22,13 @@ const ART_H: u16 = 4;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-pub struct Theme {
-    pub name: &'static str,
-    light: TColor,
-    dark: TColor,
-    last_light: TColor,
-    last_dark: TColor,
-    select: TColor,
-    check: TColor,
-    capture: TColor,
-    hint: TColor,
-    target: TColor,
-    cursor: TColor,
-    white_piece: TColor,
-    black_piece: TColor,
-}
-
-const fn rgb(r: u8, g: u8, b: u8) -> TColor {
-    TColor::Rgb(r, g, b)
-}
-
-const CURSOR: TColor = rgb(0xFF, 0xE0, 0x3A);
-const CHECK: TColor = rgb(0xD0, 0x3A, 0x2F);
-const WHITE_PIECE: TColor = rgb(0xFF, 0xFF, 0xFF);
-const BLACK_PIECE: TColor = rgb(0x10, 0x10, 0x10);
-const DOT_DARK: TColor = rgb(0x26, 0x26, 0x26);
-
-/// Square colours are mid-tones so that both white and black pieces stay readable.
-pub const THEMES: [Theme; 4] = [
-    Theme {
-        name: "Wood",
-        light: rgb(0xC4, 0x9A, 0x6C),
-        dark: rgb(0x8B, 0x5A, 0x3C),
-        last_light: rgb(0xC9, 0xB2, 0x4E),
-        last_dark: rgb(0x9A, 0x86, 0x28),
-        select: rgb(0x2E, 0x8B, 0x80),
-        check: CHECK,
-        capture: rgb(0xB0, 0x48, 0x6A),
-        hint: rgb(0x5A, 0x8C, 0xD0),
-        target: DOT_DARK,
-        cursor: CURSOR,
-        white_piece: WHITE_PIECE,
-        black_piece: BLACK_PIECE,
-    },
-    Theme {
-        name: "Forest",
-        light: rgb(0xA8, 0xB8, 0x88),
-        dark: rgb(0x6B, 0x8A, 0x4E),
-        last_light: rgb(0xCC, 0xCC, 0x55),
-        last_dark: rgb(0xA0, 0xA0, 0x30),
-        select: rgb(0x3A, 0x86, 0xB0),
-        check: CHECK,
-        capture: rgb(0xC0, 0x60, 0x40),
-        hint: rgb(0x8A, 0x6C, 0xC8),
-        target: DOT_DARK,
-        cursor: CURSOR,
-        white_piece: WHITE_PIECE,
-        black_piece: BLACK_PIECE,
-    },
-    Theme {
-        name: "Ocean",
-        light: rgb(0x92, 0xA8, 0xB8),
-        dark: rgb(0x5A, 0x74, 0x90),
-        last_light: rgb(0xB8, 0xC0, 0x70),
-        last_dark: rgb(0x88, 0x92, 0x50),
-        select: rgb(0x3E, 0xA0, 0x6A),
-        check: CHECK,
-        capture: rgb(0xC0, 0x60, 0x80),
-        hint: rgb(0xD0, 0x96, 0x4A),
-        target: DOT_DARK,
-        cursor: CURSOR,
-        white_piece: WHITE_PIECE,
-        black_piece: BLACK_PIECE,
-    },
-    Theme {
-        name: "Slate",
-        light: rgb(0x88, 0x88, 0x88),
-        dark: rgb(0x5C, 0x5C, 0x5C),
-        last_light: rgb(0xA8, 0xA0, 0x60),
-        last_dark: rgb(0x80, 0x78, 0x40),
-        select: rgb(0x40, 0x90, 0xC0),
-        check: CHECK,
-        capture: rgb(0xC0, 0x50, 0x50),
-        hint: rgb(0x5A, 0xA8, 0x6A),
-        target: rgb(0xE0, 0xE0, 0xE0),
-        cursor: CURSOR,
-        white_piece: WHITE_PIECE,
-        black_piece: BLACK_PIECE,
-    },
-];
-
-/// Index of the theme called `name`, or the first theme.
-pub fn theme_index(name: &str) -> usize {
-    THEMES.iter().position(|t| t.name == name).unwrap_or(0)
+/// What is drawn on top of the game.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Overlay {
+    Help,
+    About,
+    Confirm { question: &'static str, yes: bool },
+    Menu { menu: usize, item: usize },
 }
 
 /// Per-frame state that is not part of the game itself.
@@ -128,7 +45,8 @@ pub struct View<'a> {
     /// Clock preset for the next game, when it differs from this game's.
     pub next_clock: Option<Option<TimeControl>>,
     pub notice: Option<&'a str>,
-    pub help_open: bool,
+    pub overlay: Option<Overlay>,
+    pub menus: Vec<Menu>,
     /// The engine's expected line and the position it starts from.
     pub engine_line: Option<(&'a Board, &'a [ChessMove])>,
     pub settings_path: Option<&'a str>,
@@ -163,6 +81,28 @@ fn piece_art(piece: Piece) -> [&'static str; 4] {
     }
 }
 
+/// The desktop between the menu bar (top row) and the status bar (bottom row).
+fn body(area: Rect) -> Rect {
+    Rect {
+        x: area.x,
+        y: area.y + 1.min(area.height),
+        width: area.width,
+        height: area.height.saturating_sub(2),
+    }
+}
+
+/// A `width` x `height` rectangle in the middle of `area`, shrunk to fit.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 /// Per-frame layout geometry.
 struct Geometry {
     frame: Rect, // box-drawing frame incl. borders
@@ -175,7 +115,9 @@ struct Geometry {
     big_art: bool,
 }
 
+/// Board and panel layout for the whole screen `area`; the bars are taken off first.
 fn compute_geometry(area: Rect) -> Result<Geometry, ()> {
+    let area = body(area);
     // height budget: frame top+bottom + file-label row
     let avail_h = area.height.saturating_sub(3);
     let cell_h = (avail_h / 8).clamp(0, 6);
@@ -225,7 +167,7 @@ fn compute_geometry(area: Rect) -> Result<Geometry, ()> {
         x: frame.x + frame.width + 1,
         y: frame.y,
         width: PANEL_W,
-        height: frame.height + 1,
+        height: frame.height, // ends level with the board frame
     };
     Ok(Geometry {
         frame,
@@ -350,39 +292,356 @@ pub fn promotion_choice_at(area: Rect, click: Position) -> Option<Piece> {
         .map(|(piece, _)| piece)
 }
 
+// ----- menus and dialogs: layout shared by drawing and hit-testing ------------------------
+
+/// Each menu title's clickable area on the menu bar.
+fn menu_title_rects(area: Rect, menus: &[Menu]) -> Vec<Rect> {
+    let mut x = area.x + 1;
+    menus
+        .iter()
+        .map(|menu| {
+            let width = menu.title.chars().count() as u16 + 2;
+            let rect = Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            };
+            x += width;
+            rect.intersection(area)
+        })
+        .collect()
+}
+
+/// The menu whose title is under a mouse click.
+pub fn menu_title_at(area: Rect, menus: &[Menu], click: Position) -> Option<usize> {
+    menu_title_rects(area, menus)
+        .iter()
+        .position(|rect| rect.contains(click))
+}
+
+/// An open menu's box, one row per item and the rows of separator lines.
+struct Dropdown {
+    rect: Rect,
+    items: Vec<Rect>,
+    separators: Vec<u16>,
+    label_w: usize,
+    shortcut_w: usize,
+}
+
+fn dropdown_layout(area: Rect, menus: &[Menu], menu: usize) -> Option<Dropdown> {
+    let items = &menus.get(menu)?.items;
+    let title = *menu_title_rects(area, menus).get(menu)?;
+    let label_w = items.iter().map(|i| i.label.chars().count()).max()?;
+    let shortcut_w = items
+        .iter()
+        .filter_map(|i| i.shortcut)
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    // " • label  shortcut "
+    let inner_w = 4 + label_w + if shortcut_w > 0 { 2 + shortcut_w } else { 0 };
+    let width = inner_w as u16 + 2;
+    let separators = items.iter().filter(|i| i.separator_before).count() as u16;
+    let rect = Rect {
+        x: title.x.min((area.x + area.width).saturating_sub(width)),
+        y: area.y + 1,
+        width,
+        height: items.len() as u16 + separators + 2,
+    };
+    let mut y = rect.y + 1;
+    let mut item_rects = Vec::new();
+    let mut separator_rows = Vec::new();
+    for item in items {
+        if item.separator_before {
+            separator_rows.push(y);
+            y += 1;
+        }
+        item_rects.push(Rect {
+            x: rect.x + 1,
+            y,
+            width: inner_w as u16,
+            height: 1,
+        });
+        y += 1;
+    }
+    Some(Dropdown {
+        rect,
+        items: item_rects,
+        separators: separator_rows,
+        label_w,
+        shortcut_w,
+    })
+}
+
+/// Where a click lands relative to an open menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuHit {
+    Item(usize),
+    /// On the menu's border or a separator.
+    Inside,
+    Outside,
+}
+
+pub fn menu_item_at(area: Rect, menus: &[Menu], menu: usize, click: Position) -> MenuHit {
+    let Some(dropdown) = dropdown_layout(area, menus, menu) else {
+        return MenuHit::Outside;
+    };
+    if let Some(i) = dropdown.items.iter().position(|r| r.contains(click)) {
+        MenuHit::Item(i)
+    } else if dropdown.rect.contains(click) {
+        MenuHit::Inside
+    } else {
+        MenuHit::Outside
+    }
+}
+
+const CONFIRM_W: u16 = 40;
+const CONFIRM_H: u16 = 7;
+const BUTTON_W: u16 = 8;
+
+/// The confirmation dialog and its Yes and No buttons.
+struct ConfirmLayout {
+    dialog: Rect,
+    yes: Rect,
+    no: Rect,
+}
+
+fn confirm_layout(area: Rect) -> ConfirmLayout {
+    let dialog = centered(area, CONFIRM_W, CONFIRM_H);
+    let x = dialog.x + dialog.width.saturating_sub(2 * BUTTON_W + 2) / 2;
+    let button = |x| Rect {
+        x,
+        y: dialog.y + 4,
+        width: BUTTON_W,
+        height: 1,
+    };
+    ConfirmLayout {
+        dialog,
+        yes: button(x),
+        no: button(x + BUTTON_W + 2),
+    }
+}
+
+/// `Some(true)` for a click on Yes, `Some(false)` on No.
+pub fn confirm_button_at(area: Rect, click: Position) -> Option<bool> {
+    let layout = confirm_layout(area);
+    if layout.yes.contains(click) {
+        Some(true)
+    } else if layout.no.contains(click) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+// ----- drawing ------------------------------------------------------------------------------
+
 pub fn draw(f: &mut Frame, game: &Game, view: &View) {
     let area = f.area();
-    let geo = match compute_geometry(area) {
-        Ok(g) => g,
+    let chrome = &view.theme.chrome;
+    f.render_widget(
+        Block::default().style(Style::default().bg(chrome.desktop).fg(chrome.text)),
+        body(area),
+    );
+    draw_menu_bar(f, game, view);
+    draw_status_bar(f, view);
+    match compute_geometry(area) {
+        Ok(geo) => draw_game(f, game, view, &geo),
         Err(()) => {
             let msg = Paragraph::new(format!(
                 "Terminal too small ({}x{}). Maximize the window or reduce font size.",
                 area.width, area.height
             ))
             .alignment(Alignment::Center);
-            f.render_widget(msg, area);
-            return;
+            f.render_widget(msg, body(area));
         }
-    };
+    }
+    match view.overlay {
+        Some(Overlay::Help) => draw_help(f, chrome),
+        Some(Overlay::About) => draw_about(f, view),
+        Some(Overlay::Confirm { question, yes }) => draw_confirm(f, chrome, question, yes),
+        Some(Overlay::Menu { menu, item }) => draw_dropdown(f, view, menu, item),
+        None => {}
+    }
+}
 
-    let title_style = Style::default()
-        .fg(TColor::LightYellow)
-        .add_modifier(Modifier::BOLD);
-    let title = match view.browse {
-        Some(ply) => Span::styled(
-            format!(" Move {ply}/{} · End returns ", game.history.len()),
-            title_style,
-        ),
-        None if game.game_over() => Span::styled(format!(" {} ", game.status_text()), title_style),
-        None => Span::raw(" Chess "),
+fn bar_style(chrome: &Chrome) -> Style {
+    Style::default().bg(chrome.bar).fg(chrome.bar_text)
+}
+
+fn select_style() -> Style {
+    Style::default().bg(theme::SELECT_BG).fg(theme::SELECT_FG)
+}
+
+/// `label` in `base`, with the first occurrence of `key` (any case) in `hot`.
+fn keyed(label: &str, key: Option<char>, base: Style, hot: Style) -> Vec<Span<'static>> {
+    let found = key.and_then(|key| {
+        label
+            .char_indices()
+            .find(|(_, c)| c.to_ascii_lowercase() == key)
+    });
+    match found {
+        Some((i, c)) => {
+            let end = i + c.len_utf8();
+            vec![
+                Span::styled(label[..i].to_string(), base),
+                Span::styled(label[i..end].to_string(), hot),
+                Span::styled(label[end..].to_string(), base),
+            ]
+        }
+        None => vec![Span::styled(label.to_string(), base)],
+    }
+}
+
+/// A single-line box with a centered title, as used for the board and the panel.
+fn titled_box(chrome: &Chrome, title: String) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(chrome.border))
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(chrome.title)
+                .add_modifier(Modifier::BOLD),
+        )
+}
+
+/// Draws the frame of a dialog with its drop shadow; returns the area inside the border.
+fn dialog(f: &mut Frame, rect: Rect, title: &str, chrome: &Chrome) -> Rect {
+    let rect = rect.intersection(f.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(chrome.dialog).fg(chrome.dialog_text))
+        .title(format!(" {title} "))
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(chrome.dialog_title)
+                .add_modifier(Modifier::BOLD),
+        );
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    shadow(f.buffer_mut(), rect);
+    inner
+}
+
+/// DOS-style shadow: two columns right of `rect` and one row below, characters kept but dimmed.
+fn shadow(buf: &mut Buffer, rect: Rect) {
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    let cells = (rect.y + 1..=bottom)
+        .flat_map(|y| (right..right + 2).map(move |x| (x, y)))
+        .chain((rect.x + 2..right).map(|x| (x, bottom)));
+    for (x, y) in cells {
+        if let Some(cell) = buf.cell_mut(Position { x, y }) {
+            cell.set_bg(theme::SHADOW_BG).set_fg(theme::SHADOW_FG);
+        }
+    }
+}
+
+fn draw_menu_bar(f: &mut Frame, game: &Game, view: &View) {
+    let area = f.area();
+    if area.height == 0 {
+        return;
+    }
+    let chrome = &view.theme.chrome;
+    let base = bar_style(chrome);
+    let bar = Rect { height: 1, ..area };
+    f.render_widget(Block::default().style(base), bar);
+
+    let open = match view.overlay {
+        Some(Overlay::Menu { menu, .. }) => Some(menu),
+        _ => None,
+    };
+    let rects = menu_title_rects(area, &view.menus);
+    for (i, (menu, &rect)) in view.menus.iter().zip(&rects).enumerate() {
+        let style = if open == Some(i) {
+            select_style()
+        } else {
+            base
+        };
+        let mut spans = vec![Span::styled(" ", style)];
+        spans.extend(keyed(
+            menu.title,
+            Some(menu.key),
+            style,
+            style.fg(chrome.hotkey),
+        ));
+        spans.push(Span::styled(" ", style));
+        f.render_widget(Paragraph::new(Line::from(spans)), rect);
+    }
+
+    let titles_end = rects.last().map_or(area.x, |r| r.x + r.width);
+    let right = Rect {
+        x: titles_end + 1,
+        width: (area.x + area.width).saturating_sub(titles_end + 1),
+        ..bar
+    };
+    let mut spans = vec![Span::styled(view.engine_name.to_string(), base)];
+    if game.engine_side.is_some() {
+        spans.push(Span::styled(" · ", base));
+        spans.push(Span::styled(
+            format!("Level {}", view.level.get()),
+            base.fg(chrome.hotkey),
+        ));
+    }
+    spans.push(Span::styled(" ", base));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+        right,
+    );
+}
+
+const LEGAL_NOTICE: &str = "GPL-3.0 · no warranty ";
+
+fn draw_status_bar(f: &mut Frame, view: &View) {
+    let area = f.area();
+    if area.height < 2 {
+        return;
+    }
+    let chrome = &view.theme.chrome;
+    let base = bar_style(chrome);
+    let bar = Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
     };
     f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(title),
-        geo.frame,
+        Paragraph::new(LEGAL_NOTICE)
+            .style(base)
+            .alignment(Alignment::Right),
+        bar,
     );
+    let left = Rect {
+        width: bar
+            .width
+            .saturating_sub(LEGAL_NOTICE.chars().count() as u16 + 1),
+        ..bar
+    };
+    let hot = base.fg(chrome.hotkey);
+    let line = match view.notice {
+        Some(notice) => Line::styled(format!(" {notice}"), hot.add_modifier(Modifier::BOLD)),
+        None => Line::from(vec![
+            Span::styled(" F1", hot),
+            Span::styled(" Help  ", base),
+            Span::styled("F10", hot),
+            Span::styled(" Menu", base),
+        ]),
+    };
+    f.render_widget(Paragraph::new(line).style(base), left);
+}
+
+fn draw_game(f: &mut Frame, game: &Game, view: &View, geo: &Geometry) {
+    let chrome = &view.theme.chrome;
+    let title = match view.browse {
+        Some(ply) => format!(" Move {ply}/{} · End returns ", game.history.len()),
+        None if game.game_over() => format!(" {} ", game.status_text()),
+        None => " Chess ".to_string(),
+    };
+    f.render_widget(titled_box(chrome, title), geo.frame);
     let live = view.browse.is_none();
     let (board, last) = match view.browse {
         Some(ply) => game.position_at(ply),
@@ -396,19 +655,16 @@ pub fn draw(f: &mut Frame, game: &Game, view: &View) {
             last,
             live,
         },
-        view.theme,
-        &geo,
+        &view.theme.board,
+        geo,
     );
     if live && !game.game_over() {
-        draw_cursor(f, game, view.theme, &geo);
+        draw_cursor(f, game, &view.theme.board, geo);
     }
-    draw_labels(f, game.orientation, &geo);
+    draw_labels(f, game.orientation, chrome, geo);
     draw_panel(f, game, view, geo.panel);
     if live && let Phase::Promoting { .. } = game.phase {
-        draw_promotion_popup(f, &geo, game.board.side_to_move());
-    }
-    if view.help_open {
-        draw_help(f, area, view);
+        draw_promotion_popup(f, geo, chrome, game.board.side_to_move());
     }
 }
 
@@ -421,7 +677,7 @@ struct Shown<'a> {
     live: bool,
 }
 
-fn draw_cells(f: &mut Frame, shown: &Shown, theme: &Theme, geo: &Geometry) {
+fn draw_cells(f: &mut Frame, shown: &Shown, colors: &BoardColors, geo: &Geometry) {
     let game = shown.game;
     let board = shown.board;
     let check_sq = (*board.checkers() != EMPTY).then(|| board.king_square(board.side_to_move()));
@@ -436,25 +692,25 @@ fn draw_cells(f: &mut Frame, shown: &Shown, theme: &Theme, geo: &Geometry) {
         let occupant = board.piece_on(sq).zip(board.color_on(sq));
         let is_target = shown.live && game.legal_targets.contains(&sq);
 
-        let mut bg = if light { theme.light } else { theme.dark };
+        let mut bg = if light { colors.light } else { colors.dark };
         if shown.last.is_some_and(|(a, b)| sq == a || sq == b) {
             bg = if light {
-                theme.last_light
+                colors.last_light
             } else {
-                theme.last_dark
+                colors.last_dark
             };
         }
         if hint.is_some_and(|(a, b)| sq == a || sq == b) {
-            bg = theme.hint;
+            bg = colors.hint;
         }
         if is_target && occupant.is_some() {
-            bg = theme.capture;
+            bg = colors.capture;
         }
         if shown.live && game.phase == Phase::Selected(sq) {
-            bg = theme.select;
+            bg = colors.select;
         }
         if Some(sq) == check_sq {
-            bg = theme.check;
+            bg = colors.check;
         }
 
         let base = Style::default().bg(bg);
@@ -473,8 +729,8 @@ fn draw_cells(f: &mut Frame, shown: &Shown, theme: &Theme, geo: &Geometry) {
 
         let lines: Vec<Line> = if let Some((piece, color)) = occupant {
             let fg = match color {
-                Color::White => theme.white_piece,
-                Color::Black => theme.black_piece,
+                Color::White => colors.white_piece,
+                Color::Black => colors.black_piece,
             };
             let st = base.fg(fg).add_modifier(Modifier::BOLD);
             if geo.big_art {
@@ -487,7 +743,7 @@ fn draw_cells(f: &mut Frame, shown: &Shown, theme: &Theme, geo: &Geometry) {
                 centered(piece_glyph(color, piece).to_string(), st)
             }
         } else if is_target {
-            centered("●".to_string(), base.fg(theme.target))
+            centered("●".to_string(), base.fg(colors.target))
         } else {
             Vec::new()
         };
@@ -502,12 +758,12 @@ fn draw_cells(f: &mut Frame, shown: &Shown, theme: &Theme, geo: &Geometry) {
 }
 
 /// Corner brackets only, so the piece inside stays visible.
-fn draw_cursor(f: &mut Frame, game: &Game, theme: &Theme, geo: &Geometry) {
+fn draw_cursor(f: &mut Frame, game: &Game, colors: &BoardColors, geo: &Geometry) {
     let cell = cell_area(geo, game.orientation, game.cursor_square());
     let right = cell.x + cell.width - 1;
     let bottom = cell.y + cell.height - 1;
     let style = Style::default()
-        .fg(theme.cursor)
+        .fg(colors.cursor)
         .add_modifier(Modifier::BOLD);
     let buf = f.buffer_mut();
     for (x, y, ch) in [
@@ -522,8 +778,8 @@ fn draw_cursor(f: &mut Frame, game: &Game, theme: &Theme, geo: &Geometry) {
     }
 }
 
-fn draw_labels(f: &mut Frame, orientation: Color, geo: &Geometry) {
-    let label_style = Style::default().fg(TColor::DarkGray);
+fn draw_labels(f: &mut Frame, orientation: Color, chrome: &Chrome, geo: &Geometry) {
+    let label_style = Style::default().fg(chrome.text);
     for i in 0..8u8 {
         let rank_sq = Square::make_square(Rank::from_index(i as usize), File::A);
         let row = screen_cell(orientation, rank_sq).y;
@@ -580,10 +836,10 @@ fn eval_fraction(eval: Option<Eval>) -> f64 {
 fn eval_bar(width: usize, eval: Option<Eval>) -> Line<'static> {
     let white = ((eval_fraction(eval) * width as f64).round() as usize).min(width);
     Line::from(vec![
-        Span::styled("█".repeat(white), Style::default().fg(TColor::White)),
+        Span::styled("█".repeat(white), Style::default().fg(theme::WHITE)),
         Span::styled(
             "█".repeat(width - white),
-            Style::default().fg(TColor::DarkGray),
+            Style::default().fg(theme::DARK_GRAY),
         ),
     ])
 }
@@ -636,6 +892,7 @@ fn clock_text(d: Duration) -> String {
 }
 
 fn clock_row(game: &Game, view: &View) -> Line<'static> {
+    let chrome = &view.theme.chrome;
     let mut spans = Vec::new();
     match &game.clock {
         None => spans.push(Span::raw("No clock")),
@@ -644,10 +901,10 @@ fn clock_row(game: &Game, view: &View) -> Line<'static> {
                 let left = clock.remaining(color, view.now);
                 let mut style = Style::default();
                 if clock.running() == Some(color) {
-                    style = style.add_modifier(Modifier::BOLD);
+                    style = style.fg(chrome.value).add_modifier(Modifier::BOLD);
                 }
                 if left.is_zero() {
-                    style = style.fg(TColor::LightRed);
+                    style = style.fg(chrome.alert);
                 }
                 if color == Color::Black {
                     spans.push(Span::raw(" "));
@@ -659,59 +916,47 @@ fn clock_row(game: &Game, view: &View) -> Line<'static> {
     if let Some(next) = view.next_clock {
         spans.push(Span::styled(
             format!(" →{}", clock::preset_name(next)),
-            Style::default().fg(TColor::DarkGray),
+            Style::default().fg(chrome.dim),
         ));
     }
     Line::from(spans)
 }
 
-fn draw_panel(f: &mut Frame, game: &Game, view: &View, rect: Rect) {
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(TColor::DarkGray);
-    let inner_w = rect.width.saturating_sub(2) as usize;
-    let inner_h = rect.height.saturating_sub(2) as usize;
-    let board = &game.board;
-    let two_player = game.engine_side.is_none();
+/// Inner lines of the GAME box, which keeps this height so the boxes below never move.
+const GAME_LINES: usize = 4;
 
-    let mut top: Vec<Line> = Vec::new();
+fn draw_panel(f: &mut Frame, game: &Game, view: &View, rect: Rect) {
+    let chrome = &view.theme.chrome;
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(chrome.dim);
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let board = &game.board;
+
+    let mut status: Vec<Line> = Vec::new();
     if game.game_over() {
-        top.push(Line::styled(
+        status.push(Line::styled(
             game.status_text(),
             Style::default()
-                .fg(TColor::Black)
-                .bg(TColor::LightYellow)
+                .fg(theme::BLACK)
+                .bg(chrome.value)
                 .add_modifier(Modifier::BOLD),
         ));
-        let keys = if game.is_final() {
-            "r new · n swap"
-        } else {
-            "r new · n swap · u undo"
-        };
-        top.push(Line::styled(keys, dim));
     } else if let Some(label) = view.thinking {
         let spin = SPINNER[(view.tick as usize / 2) % SPINNER.len()];
-        top.push(Line::from(vec![
-            Span::styled(format!("{spin} "), Style::default().fg(TColor::Cyan)),
-            Span::styled(label.to_string(), Style::default().fg(TColor::Yellow)),
+        status.push(Line::from(vec![
+            Span::styled(format!("{spin} "), dim),
+            Span::styled(label.to_string(), Style::default().fg(chrome.value)),
         ]));
     } else {
-        let status = game.status_text();
-        let color = if status.contains("Check") {
-            TColor::LightRed
+        let text = game.status_text();
+        let color = if text.contains("Check") {
+            chrome.alert
         } else {
-            TColor::Yellow
+            chrome.value
         };
-        top.push(Line::styled(status, Style::default().fg(color)));
+        status.push(Line::styled(text, Style::default().fg(color)));
     }
-    if let Some(notice) = view.notice {
-        top.push(Line::styled(
-            notice.to_string(),
-            Style::default().fg(TColor::LightRed),
-        ));
-    }
-
-    // Players, engine, clocks, evaluation.
-    top.push(match game.engine_side {
+    status.push(match game.engine_side {
         Some(engine) => Line::from(format!(
             "You {} · AI {}",
             color_name(!engine),
@@ -719,25 +964,29 @@ fn draw_panel(f: &mut Frame, game: &Game, view: &View, rect: Rect) {
         )),
         None => Line::from("White vs Black"),
     });
-    let engine_row = if two_player {
-        view.engine_name.to_string()
-    } else {
-        format!("{} · L{}", view.engine_name, view.level.get())
-    };
-    top.push(Line::styled(engine_row, dim));
-    top.push(clock_row(game, view));
+    status.push(clock_row(game, view));
+    if game.game_over() {
+        let keys = if game.is_final() {
+            "r new · n swap"
+        } else {
+            "r new · n swap · u undo"
+        };
+        status.push(Line::styled(keys, dim));
+    }
+
     let depth = game.eval_depth.map_or(String::new(), |d| format!("  d{d}"));
-    top.push(Line::from(vec![
-        Span::styled("Eval ", bold),
-        Span::raw(format!("{}{depth}", eval_label(game.eval))),
-    ]));
-    top.push(eval_bar(inner_w, game.eval));
     let line = view
         .engine_line
         .map_or(String::new(), |(b, moves)| line_text(b, moves, inner_w));
-    top.push(Line::styled(line, dim));
+    let evaluation = vec![
+        Line::from(vec![
+            Span::styled("Eval ", bold),
+            Span::raw(format!("{}{depth}", eval_label(game.eval))),
+        ]),
+        eval_bar(inner_w, game.eval),
+        Line::styled(line, dim),
+    ];
 
-    // Material and captures.
     let (me, them, me_label, them_label) = match game.engine_side {
         Some(engine) => (!engine, engine, "You ", "AI  "),
         None => (Color::White, Color::Black, "W ", "B "),
@@ -750,45 +999,46 @@ fn draw_panel(f: &mut Frame, game: &Game, view: &View, rect: Rect) {
         (d, None) if d > 0 => format!("+{d} White"),
         (d, None) => format!("+{} Black", -d),
     };
-    top.push(Line::from(format!("Material {material_text}")));
-    top.push(Line::from(vec![
-        Span::raw(me_label),
-        captured_span(them, &captured_pieces(board, them)),
-    ]));
-    top.push(Line::from(vec![
-        Span::raw(them_label),
-        captured_span(me, &captured_pieces(board, me)),
-    ]));
-    top.push(Line::styled("Moves", bold));
-
-    let bottom: Vec<Line> = vec![
-        Line::styled("? help", dim),
-        Line::styled("GPL-3.0 · no warranty", dim),
+    let material_lines = vec![
+        Line::from(format!("Material {material_text}")),
+        Line::from(vec![
+            Span::raw(me_label),
+            captured_span(them, &captured_pieces(board, them)),
+        ]),
+        Line::from(vec![
+            Span::raw(them_label),
+            captured_span(me, &captured_pieces(board, me)),
+        ]),
     ];
 
-    let move_lines = move_rows(game, view.browse);
-    let rows = inner_h.saturating_sub(top.len() + bottom.len());
+    // Boxes stacked top to bottom; MOVES takes the rest and shows the latest moves.
+    let fixed = GAME_LINES as u16 + 2 + 5 + 5;
+    let rows = rect.height.saturating_sub(fixed + 2) as usize;
+    let move_lines = move_rows(game, view.browse, chrome);
     let start = move_lines.len().saturating_sub(rows);
-    let filler = rows.saturating_sub(move_lines.len() - start);
-
-    let lines: Vec<Line> = top
-        .into_iter()
-        .chain(move_lines.into_iter().skip(start))
-        .chain(std::iter::repeat_n(Line::from(""), filler))
-        .chain(bottom)
-        .collect();
-    let panel = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded),
-    );
-    f.render_widget(panel, rect);
+    let moves = move_lines.into_iter().skip(start).collect();
+    let sections = [
+        ("Game", status, GAME_LINES as u16 + 2),
+        ("Evaluation", evaluation, 5),
+        ("Material", material_lines, 5),
+        ("Moves", moves, rect.height.saturating_sub(fixed)),
+    ];
+    let bottom = rect.y + rect.height;
+    let mut y = rect.y;
+    for (title, lines, height) in sections {
+        let height = height.min(bottom - y);
+        f.render_widget(
+            Paragraph::new(lines).block(titled_box(chrome, format!(" {title} "))),
+            Rect { y, height, ..rect },
+        );
+        y += height;
+    }
 }
 
 /// One row per full move, numbered from the start position; the move leading to the shown
 /// position is highlighted.
-fn move_rows(game: &Game, browse: Option<usize>) -> Vec<Line<'static>> {
-    let dim = Style::default().fg(TColor::DarkGray);
+fn move_rows(game: &Game, browse: Option<usize>, chrome: &Chrome) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(chrome.dim);
     let highlight = match browse {
         Some(ply) => ply.checked_sub(1),
         None => game.history.len().checked_sub(1),
@@ -810,7 +1060,7 @@ fn move_rows(game: &Game, browse: Option<usize>) -> Vec<Line<'static>> {
                 };
                 let text = format!("{:<9}", figurine(&p.san, p.before.side_to_move()));
                 let style = if Some(ply) == highlight {
-                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    bar_style(chrome).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -827,15 +1077,15 @@ fn captured_span(cap_color: Color, captured: &[(Piece, u8)]) -> Span<'static> {
         .flat_map(|&(piece, n)| std::iter::repeat_n(piece_glyph(cap_color, piece), n as usize))
         .collect();
     let fg = match cap_color {
-        Color::White => TColor::White,
-        Color::Black => TColor::Gray,
+        Color::White => theme::WHITE,
+        Color::Black => theme::LIGHT_GRAY,
     };
     Span::styled(s, Style::default().fg(fg))
 }
 
-fn draw_promotion_popup(f: &mut Frame, geo: &Geometry, color: Color) {
+fn draw_promotion_popup(f: &mut Frame, geo: &Geometry, chrome: &Chrome, color: Color) {
     let (popup, cells) = promotion_layout(geo);
-    f.render_widget(Clear, popup);
+    let inner = dialog(f, popup, "Promotion", chrome);
     f.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -845,16 +1095,10 @@ fn draw_promotion_popup(f: &mut Frame, geo: &Geometry, color: Color) {
             Line::from(""),
             Line::from(""),
             Line::from(""),
-            Line::styled("click or key · Esc", Style::default().fg(TColor::DarkGray)),
+            Line::from("click or key · Esc"),
         ])
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .title("Promotion"),
-        ),
-        popup,
+        .alignment(Alignment::Center),
+        inner,
     );
     for (piece, rect) in cells {
         f.render_widget(
@@ -865,7 +1109,9 @@ fn draw_promotion_popup(f: &mut Frame, geo: &Geometry, color: Color) {
                 ),
                 Line::styled(
                     piece_letter(piece).to_string(),
-                    Style::default().fg(TColor::LightMagenta),
+                    Style::default()
+                        .fg(chrome.dialog_title)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
             .alignment(Alignment::Center),
@@ -874,11 +1120,12 @@ fn draw_promotion_popup(f: &mut Frame, geo: &Geometry, color: Color) {
     }
 }
 
-const HELP: [(&str, &str); 19] = [
+const HELP: [(&str, &str); 20] = [
     ("←↑↓→ / hjkl", "move the cursor"),
     ("Enter / click", "select, then move"),
     ("drag", "move a piece with the mouse"),
     ("Esc", "cancel"),
+    ("F10 / Alt+key", "menus"),
     ("u", "undo"),
     ("r", "restart"),
     ("n", "new game, other side"),
@@ -888,53 +1135,136 @@ const HELP: [(&str, &str); 19] = [
     ("s", "suggest a move"),
     ("c", "clock for the next game"),
     ("t", "next theme"),
-    ("x", "resign (press twice)"),
-    ("d", "offer a draw (twice)"),
+    ("x", "resign"),
+    ("d", "offer a draw"),
     (", / .", "step through the game"),
     ("Home / End", "first / current position"),
     ("? / F1", "this help"),
     ("q", "quit"),
 ];
 
-fn draw_help(f: &mut Frame, area: Rect, view: &View) {
+/// A dialog sized to `lines`, centered on the screen.
+fn text_dialog(f: &mut Frame, chrome: &Chrome, title: &str, width: u16, lines: Vec<Line>) {
+    let area = f.area();
+    let rect = centered(area, width, lines.len() as u16 + 2);
+    let inner = dialog(f, rect, title, chrome);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_help(f: &mut Frame, chrome: &Chrome) {
     let key = Style::default()
-        .fg(TColor::LightMagenta)
+        .fg(chrome.dialog_title)
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(TColor::DarkGray);
     let mut lines: Vec<Line> = HELP
         .iter()
         .map(|(k, what)| {
             Line::from(vec![
-                Span::styled(format!("{k:<14}"), key),
+                Span::styled(format!(" {k:<14}"), key),
                 Span::raw(*what),
             ])
         })
         .collect();
     lines.push(Line::from(""));
-    lines.push(Line::styled(format!("Engine: {}", view.engine_name), dim));
-    if let Some(path) = view.settings_path {
-        lines.push(Line::styled(format!("Settings: {path}"), dim));
-    }
-    lines.push(Line::styled("Press any key to close", dim));
+    lines.push(Line::from(" Press any key to close"));
+    text_dialog(f, chrome, "Keys", 46, lines);
+}
 
-    let width = 46u16.min(area.width.saturating_sub(2));
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let popup = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-    f.render_widget(Clear, popup);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Keys "),
+fn draw_about(f: &mut Frame, view: &View) {
+    let mut lines = vec![
+        Line::styled(
+            format!(" TuiChess {}", env!("CARGO_PKG_VERSION")),
+            Style::default().add_modifier(Modifier::BOLD),
         ),
-        popup,
+        Line::from(format!(" by {}", env!("CARGO_PKG_AUTHORS"))),
+        Line::from(""),
+        Line::from(format!(" Engine: {}", view.engine_name)),
+    ];
+    if let Some(path) = view.settings_path {
+        lines.push(Line::from(format!(" Settings: {path}")));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(" GPL-3.0-or-later · no warranty"));
+    lines.push(Line::from(" Press any key to close"));
+    text_dialog(f, &view.theme.chrome, "About", 60, lines);
+}
+
+fn draw_confirm(f: &mut Frame, chrome: &Chrome, question: &str, yes: bool) {
+    let layout = confirm_layout(f.area());
+    let inner = dialog(f, layout.dialog, "Confirm", chrome);
+    f.render_widget(
+        Paragraph::new(vec![Line::from(""), Line::from(question.to_string())])
+            .alignment(Alignment::Center),
+        inner,
     );
+    for (label, rect, focused) in [("Yes", layout.yes, yes), ("No", layout.no, !yes)] {
+        let style = if focused {
+            select_style()
+        } else {
+            bar_style(chrome)
+        };
+        let key = label.chars().next().map(|c| c.to_ascii_lowercase());
+        let mut spans = vec![Span::styled("< ", style)];
+        spans.extend(keyed(label, key, style, style.fg(chrome.hotkey)));
+        spans.push(Span::styled(" >", style));
+        f.render_widget(
+            Paragraph::new(Line::from(spans))
+                .style(style)
+                .alignment(Alignment::Center),
+            rect.intersection(f.area()),
+        );
+    }
+}
+
+fn draw_dropdown(f: &mut Frame, view: &View, menu: usize, selected: usize) {
+    let area = f.area();
+    let Some(dropdown) = dropdown_layout(area, &view.menus, menu) else {
+        return;
+    };
+    let chrome = &view.theme.chrome;
+    let base = bar_style(chrome);
+    let rect = dropdown.rect.intersection(area);
+    f.render_widget(Clear, rect);
+    f.render_widget(Block::default().borders(Borders::ALL).style(base), rect);
+    for &y in &dropdown.separators {
+        let line = format!("├{}┤", "─".repeat(rect.width.saturating_sub(2) as usize));
+        f.render_widget(
+            Paragraph::new(line).style(base),
+            Rect {
+                y,
+                height: 1,
+                ..rect
+            }
+            .intersection(area),
+        );
+    }
+    for (i, (item, &row)) in view.menus[menu]
+        .items
+        .iter()
+        .zip(&dropdown.items)
+        .enumerate()
+    {
+        let style = if i == selected { select_style() } else { base };
+        let mark = if item.checked == Some(true) {
+            '•'
+        } else {
+            ' '
+        };
+        let mut spans = vec![Span::styled(format!(" {mark} "), style)];
+        spans.extend(keyed(&item.label, item.key, style, style.fg(chrome.hotkey)));
+        let pad = dropdown.label_w - item.label.chars().count();
+        spans.push(Span::styled(" ".repeat(pad), style));
+        if dropdown.shortcut_w > 0 {
+            let shortcut = item.shortcut.unwrap_or("");
+            let w = dropdown.shortcut_w;
+            spans.push(Span::styled(format!("  {shortcut:>w$}"), style));
+        }
+        spans.push(Span::styled(" ", style));
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(style),
+            row.intersection(area),
+        );
+    }
+    shadow(f.buffer_mut(), rect);
 }
 
 #[cfg(test)]
@@ -942,7 +1272,10 @@ mod tests {
     use super::*;
     use crate::clock::PRESETS;
     use crate::game::tests::{game, play, white_game};
-    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+    use crate::menu::{self, Context};
+    use crate::settings::Settings;
+    use crate::theme::THEMES;
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn view() -> View<'static> {
         View {
@@ -955,7 +1288,12 @@ mod tests {
             browse: None,
             next_clock: None,
             notice: None,
-            help_open: false,
+            overlay: None,
+            menus: menu::build(Context {
+                settings: &Settings::default(),
+                uci: false,
+                engine_name: "built-in",
+            }),
             engine_line: None,
             settings_path: None,
         }
@@ -987,6 +1325,20 @@ mod tests {
         Instant::now()
     }
 
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 40,
+    };
+
+    fn middle(rect: Rect) -> Position {
+        Position {
+            x: rect.x + rect.width / 2,
+            y: rect.y + rect.height / 2,
+        }
+    }
+
     #[test]
     fn renders_initial_position() {
         let mut g = white_game();
@@ -995,10 +1347,24 @@ mod tests {
         let content = render(&g, 100, 40);
         assert!(content.contains('█'), "piece art should be rendered");
         assert!(content.contains('●'), "legal target markers should appear");
-        assert!(content.contains("Chess"));
-        assert!(content.contains("? help"));
+        assert!(
+            content.contains("─ Chess ─"),
+            "title with a space on each side"
+        );
+        assert!(content.contains(" Game  Level  Clock  Engine  Theme  Help "));
+        assert!(content.contains("F1 Help  F10 Menu"));
         assert!(content.contains("no warranty"));
         assert!(content.contains('┏'), "cursor corners should appear");
+    }
+
+    #[test]
+    fn desktop_and_bars_use_theme_colours() {
+        let buf = render_buf(&white_game(), 100, 40);
+        let chrome = &THEMES[0].chrome;
+        assert_eq!(buf[(0, 1)].bg, chrome.desktop);
+        assert_eq!(buf[(0, 0)].bg, chrome.bar);
+        assert_eq!(buf[(0, 39)].bg, chrome.bar);
+        assert_eq!(buf[(2, 0)].fg, chrome.hotkey, "G of Game");
     }
 
     #[test]
@@ -1019,10 +1385,10 @@ mod tests {
                 ((3, 6), (3, 5)),
             ],
         );
-        let content = render(&g, 80, 27); // gives cell_h == 3 -> glyph fallback
+        let content = render(&g, 80, 29); // gives cell_h == 3 -> glyph fallback
         assert!(content.contains('♙'), "glyph fallback should render");
         assert!(content.contains('♛'));
-        assert!(content.contains("no warranty"), "footer fits");
+        assert!(content.contains("no warranty"), "status bar fits");
         assert!(content.contains("5. c3"), "at least 5 move rows fit");
     }
 
@@ -1040,9 +1406,13 @@ mod tests {
         let content = render(&g, 100, 40);
         assert!(content.contains("♘f3"), "figurine notation");
         assert!(content.contains("Material"));
-        assert!(content.contains("Moves"));
+        assert!(
+            content.contains("─ Moves ─"),
+            "title with a space on each side"
+        );
+        assert!(content.contains("─ Evaluation ─"));
         assert!(content.contains("You White · AI Black"));
-        assert!(content.contains("built-in · L4"));
+        assert!(content.contains("built-in · Level 4"), "menu bar");
     }
 
     #[test]
@@ -1052,6 +1422,7 @@ mod tests {
         let content = render(&g, 100, 40);
         assert!(content.contains(" 12. …"), "{content}");
         assert!(content.contains("White vs Black"));
+        assert!(!content.contains("Level 4"), "no level in two-player mode");
     }
 
     #[test]
@@ -1065,7 +1436,7 @@ mod tests {
         g.confirm(now());
         let buf = render_buf(&g, 100, 40);
         let cell = cell_area(&geo(100, 40), Color::White, Square::D5);
-        assert_eq!(buf[(cell.x + 1, cell.y + 1)].bg, THEMES[0].capture);
+        assert_eq!(buf[(cell.x + 1, cell.y + 1)].bg, THEMES[0].board.capture);
     }
 
     #[test]
@@ -1074,7 +1445,7 @@ mod tests {
         assert!(g.set_hint(ChessMove::new(Square::E2, Square::E4, None)));
         let buf = render_buf(&g, 100, 40);
         let cell = cell_area(&geo(100, 40), Color::White, Square::E4);
-        assert_eq!(buf[(cell.x + 1, cell.y + 1)].bg, THEMES[0].hint);
+        assert_eq!(buf[(cell.x + 1, cell.y + 1)].bg, THEMES[0].board.hint);
     }
 
     #[test]
@@ -1145,6 +1516,15 @@ mod tests {
     }
 
     #[test]
+    fn notice_replaces_the_status_bar_hints() {
+        let mut v = view();
+        v.notice = Some("Level 5/8");
+        let content = text(&render_buf_with(&white_game(), &v, 100, 40));
+        assert!(content.contains("Level 5/8"));
+        assert!(!content.contains("F10 Menu"));
+    }
+
+    #[test]
     fn browsing_shows_the_past_position() {
         let mut g = white_game();
         play(&mut g, &[((4, 1), (4, 3)), ((4, 6), (4, 4))]);
@@ -1155,22 +1535,21 @@ mod tests {
         // The start position has no last move, so e2 shows its plain colour.
         let geo = geo(100, 40);
         let e2 = cell_area(&geo, Color::White, Square::E2);
-        assert_eq!(buf[(e2.x + 1, e2.y + 1)].bg, THEMES[0].light);
+        assert_eq!(buf[(e2.x + 1, e2.y + 1)].bg, THEMES[0].board.light);
         assert!(!text(&buf).contains('┏'), "no cursor while browsing");
     }
 
     #[test]
     fn promotion_popup_hit_test() {
-        let area = Rect::new(0, 0, 100, 40);
         let (_, cells) = promotion_layout(&geo(100, 40));
         for (piece, rect) in cells {
             let click = Position {
                 x: rect.x + 2,
                 y: rect.y,
             };
-            assert_eq!(promotion_choice_at(area, click), Some(piece));
+            assert_eq!(promotion_choice_at(AREA, click), Some(piece));
         }
-        assert_eq!(promotion_choice_at(area, Position { x: 0, y: 0 }), None);
+        assert_eq!(promotion_choice_at(AREA, Position { x: 0, y: 0 }), None);
 
         let mut g = game(Some(Color::Black), Some("7k/P7/8/8/8/8/8/K7 w - - 0 1"));
         g.cursor = (0, 6);
@@ -1186,33 +1565,94 @@ mod tests {
     fn help_overlay_lists_keys() {
         let g = white_game();
         let mut v = view();
-        v.help_open = true;
-        v.settings_path = Some("C:/cfg/settings.txt");
+        v.overlay = Some(Overlay::Help);
         let content = text(&render_buf_with(&g, &v, 100, 40));
         assert!(content.contains("suggest a move"));
+        assert!(content.contains("F10 / Alt+key"));
+    }
+
+    #[test]
+    fn about_shows_engine_and_settings_path() {
+        let mut v = view();
+        v.overlay = Some(Overlay::About);
+        v.settings_path = Some("C:/cfg/settings.txt");
+        let content = text(&render_buf_with(&white_game(), &v, 100, 40));
+        assert!(content.contains("by Saman Sedighi Rad"));
+        assert!(content.contains("Engine: built-in"));
         assert!(content.contains("Settings: C:/cfg/settings.txt"));
     }
 
     #[test]
+    fn open_menu_shows_items_and_marks_the_choice() {
+        let mut v = view();
+        v.overlay = Some(Overlay::Menu { menu: 4, item: 1 });
+        let buf = render_buf_with(&white_game(), &v, 100, 40);
+        let content = text(&buf);
+        assert!(content.contains(" • Blue "));
+        assert!(content.contains("   Black "));
+        let dropdown = dropdown_layout(AREA, &v.menus, 4).unwrap();
+        let black = dropdown.items[1];
+        assert_eq!(buf[(black.x + 3, black.y)].bg, theme::SELECT_BG);
+
+        v.overlay = Some(Overlay::Menu { menu: 0, item: 0 });
+        let content = text(&render_buf_with(&white_game(), &v, 100, 40));
+        assert!(content.contains("Resign"));
+        assert!(content.contains('├'), "separator");
+    }
+
+    #[test]
+    fn menu_hit_tests_match_the_layout() {
+        let menus = view().menus;
+        for (i, rect) in menu_title_rects(AREA, &menus).into_iter().enumerate() {
+            assert_eq!(menu_title_at(AREA, &menus, middle(rect)), Some(i));
+            let dropdown = dropdown_layout(AREA, &menus, i).unwrap();
+            for (j, &row) in dropdown.items.iter().enumerate() {
+                assert_eq!(menu_item_at(AREA, &menus, i, middle(row)), MenuHit::Item(j));
+            }
+            let corner = Position {
+                x: dropdown.rect.x,
+                y: dropdown.rect.y,
+            };
+            assert_eq!(menu_item_at(AREA, &menus, i, corner), MenuHit::Inside);
+        }
+        let game = dropdown_layout(AREA, &menus, 0).unwrap();
+        let separator = Position {
+            x: game.rect.x + 2,
+            y: game.separators[0],
+        };
+        assert_eq!(menu_item_at(AREA, &menus, 0, separator), MenuHit::Inside);
+        let far = Position { x: 90, y: 30 };
+        assert_eq!(menu_item_at(AREA, &menus, 0, far), MenuHit::Outside);
+        assert_eq!(menu_title_at(AREA, &menus, far), None);
+    }
+
+    #[test]
+    fn confirm_dialog_and_buttons() {
+        let mut v = view();
+        v.overlay = Some(Overlay::Confirm {
+            question: "Resign this game?",
+            yes: false,
+        });
+        let buf = render_buf_with(&white_game(), &v, 100, 40);
+        let content = text(&buf);
+        assert!(content.contains("Resign this game?"));
+        assert!(content.contains("< Yes >"));
+        let layout = confirm_layout(AREA);
+        assert_eq!(buf[(layout.no.x, layout.no.y)].bg, theme::SELECT_BG);
+        assert_eq!(confirm_button_at(AREA, middle(layout.yes)), Some(true));
+        assert_eq!(confirm_button_at(AREA, middle(layout.no)), Some(false));
+        assert_eq!(confirm_button_at(AREA, middle(layout.dialog)), None);
+    }
+
+    #[test]
     fn click_maps_to_square_in_both_orientations() {
-        let area = Rect::new(0, 0, 100, 40);
         let geo = geo(100, 40);
         for orientation in [Color::White, Color::Black] {
             for sq in [Square::E2, Square::A1, Square::H8] {
                 let cell = cell_area(&geo, orientation, sq);
-                let click = Position {
-                    x: cell.x + cell.width / 2,
-                    y: cell.y + cell.height / 2,
-                };
-                assert_eq!(square_at(area, orientation, click), Some(sq));
+                assert_eq!(square_at(AREA, orientation, middle(cell)), Some(sq));
             }
         }
-        assert_eq!(square_at(area, Color::White, Position { x: 0, y: 0 }), None);
-    }
-
-    #[test]
-    fn theme_lookup_by_name() {
-        assert_eq!(theme_index("Ocean"), 2);
-        assert_eq!(theme_index("nope"), 0);
+        assert_eq!(square_at(AREA, Color::White, Position { x: 0, y: 0 }), None);
     }
 }
