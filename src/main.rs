@@ -1,4 +1,6 @@
 mod ai;
+#[cfg(bundled_stockfish)]
+mod bundled;
 mod engine;
 mod game;
 mod ui;
@@ -41,6 +43,7 @@ fn main() -> io::Result<()> {
         default_hook(info);
     }));
 
+    println!("Starting engine…"); // the first start unpacks ~100 MB; the alt screen hides this after
     let engine = Engine::detect();
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;

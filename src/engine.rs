@@ -1,7 +1,8 @@
-//! Engine front-end: the built-in search, or an external UCI engine (e.g. Stockfish) when one
-//! is available. Set `CHESS_ENGINE` to an engine path, or to `builtin` to skip detection.
+//! Engine front-end: a UCI engine (normally the bundled Stockfish, see `bundled.rs`) or the
+//! built-in search. Set `CHESS_ENGINE` to an engine path, or to `builtin` to skip detection.
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -14,7 +15,8 @@ use crate::ai;
 
 const BUILTIN_TIME: Duration = Duration::from_millis(1500);
 const UCI_MOVETIME_MS: u64 = 1000;
-const UCI_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Generous: the first start of a ~100 MB engine binary may include an antivirus scan.
+const UCI_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Position score from White's point of view.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,16 +73,25 @@ pub enum Engine {
 }
 
 impl Engine {
+    /// First that works: `CHESS_ENGINE`, the bundled Stockfish, `stockfish` on PATH, built-in.
     pub fn detect() -> Engine {
-        let path = match std::env::var("CHESS_ENGINE") {
+        match std::env::var("CHESS_ENGINE") {
             Ok(v) if v.eq_ignore_ascii_case("builtin") => return Engine::Builtin,
-            Ok(v) => v,
-            Err(_) => "stockfish".to_string(),
-        };
-        match UciEngine::start(&path) {
-            Some(engine) => Engine::Uci(engine),
-            None => Engine::Builtin,
+            Ok(v) => {
+                if let Some(engine) = UciEngine::start(Path::new(&v)) {
+                    return Engine::Uci(engine);
+                }
+            }
+            Err(_) => {}
         }
+        #[cfg(bundled_stockfish)]
+        if let Some(engine) = crate::bundled::path()
+            .ok()
+            .and_then(|path| UciEngine::start(&path))
+        {
+            return Engine::Uci(engine);
+        }
+        UciEngine::start(Path::new("stockfish")).map_or(Engine::Builtin, Engine::Uci)
     }
 
     pub fn name(&self) -> &str {
@@ -119,7 +130,7 @@ pub struct UciEngine {
 
 impl UciEngine {
     /// Spawns the engine and completes the UCI handshake, or returns `None`.
-    fn start(path: &str) -> Option<UciEngine> {
+    fn start(path: &Path) -> Option<UciEngine> {
         let mut child = Command::new(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -339,6 +350,32 @@ mod tests {
 
     #[test]
     fn missing_engine_falls_back() {
-        assert!(UciEngine::start("definitely-not-a-chess-engine-xyz").is_none());
+        assert!(UciEngine::start(Path::new("definitely-not-a-chess-engine-xyz")).is_none());
+    }
+
+    #[cfg(bundled_stockfish)]
+    #[test]
+    fn bundled_stockfish_plays_a_legal_move() {
+        let dir = crate::bundled::tests::temp_dir("uci");
+        let path = crate::bundled::extract_to(&dir).unwrap();
+        let engine = Engine::Uci(UciEngine::start(&path).expect("bundled Stockfish starts"));
+        assert!(
+            engine.name().starts_with("Stockfish"),
+            "name: {}",
+            engine.name()
+        );
+
+        let req = SearchRequest {
+            root: Board::default(),
+            moves: Vec::new(),
+        };
+        let result = engine
+            .think(req)
+            .recv_timeout(Duration::from_secs(10))
+            .expect("answer in time")
+            .expect("a move");
+        assert!(MoveGen::new_legal(&Board::default()).any(|m| m == result.mv));
+        drop(engine); // stop the process before removing its file
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

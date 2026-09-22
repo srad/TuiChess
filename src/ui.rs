@@ -565,6 +565,7 @@ fn draw_panel(f: &mut Frame, game: &Game, view: &View, rect: Rect) {
         Line::styled("n switch side", dim),
         Line::styled(format!("t theme ({})", view.theme.name), dim),
         Line::styled("Esc cancel  q quit", dim),
+        Line::styled("GPL-3.0 · no warranty", dim),
     ];
 
     // Move list: one line per full move, newest at the bottom, last ply highlighted.

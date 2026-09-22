@@ -3,7 +3,8 @@ name = "tuichess"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Terminal chess against a built-in or UCI engine"
+description = "Terminal chess against a bundled Stockfish or a built-in engine"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/srad/TuiChess"
 readme = "README.md"
 keywords = ["chess", "tui", "terminal", "ratatui", "uci"]
@@ -12,4 +13,20 @@ categories = ["games", "command-line-utilities"]
 [dependencies]
 chess = "3.2"
 crossterm = "0.28"
+dirs = "7"
 ratatui = "0.29"
+
+[build-dependencies]
+flate2 = "1.1"
+sha2 = "0.11"
+tar = "0.4"
+# OS trust store: works behind TLS-inspecting proxies/antivirus; integrity comes from the pinned sha256.
+ureq = { version = "3.4", features = ["platform-verifier"] }
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# build.rs hashes and inflates a ~100 MB Stockfish archive; unoptimized that takes tens of seconds.
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
