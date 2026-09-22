@@ -1,0 +1,43 @@
+# Rust build output (Cargo.lock is committed: this is a binary crate)
+/target
+**/*.rs.bk
+*.pdb
+
+# Profiling / coverage
+*.profraw
+*.profdata
+/coverage/
+flamegraph.svg
+perf.data*
+
+# Editors / IDEs
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+
+# AI / code-navigation tool state
+.serena/
+.codegraph/
+.claude/
+
+# OS files
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log

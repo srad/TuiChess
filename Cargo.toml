@@ -1,0 +1,15 @@
+[package]
+name = "tuichess"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Terminal chess against a built-in or UCI engine"
+repository = "https://github.com/srad/TuiChess"
+readme = "README.md"
+keywords = ["chess", "tui", "terminal", "ratatui", "uci"]
+categories = ["games", "command-line-utilities"]
+
+[dependencies]
+chess = "3.2"
+crossterm = "0.28"
+ratatui = "0.29"
