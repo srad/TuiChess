@@ -4,8 +4,6 @@
 
 Play chess against an engine in your terminal.
 
-By Saman Sedighi Rad
-
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Edition](https://img.shields.io/badge/edition-2024-blue)](https://doc.rust-lang.org/edition-guide/)
 [![ratatui](https://img.shields.io/badge/built%20with-ratatui-8A2BE2)](https://ratatui.rs)
