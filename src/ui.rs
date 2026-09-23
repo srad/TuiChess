@@ -4,12 +4,13 @@ use chess::{ALL_SQUARES, Board, ChessMove, Color, EMPTY, File, Piece, Rank, Squa
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Alignment, Position, Rect},
+    layout::{Alignment, Position, Rect, Size},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::art::{self, ArtSize};
 use crate::clock::{self, TimeControl};
 use crate::engine::{Eval, Level};
 use crate::game::{Game, Phase, captured_pieces, material, piece_letter, san};
@@ -17,8 +18,6 @@ use crate::menu::Menu;
 use crate::theme::{self, BoardColors, Chrome, Theme};
 
 const PANEL_W: u16 = 26;
-const ART_W: u16 = 7;
-const ART_H: u16 = 4;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -69,18 +68,6 @@ fn piece_glyph(color: Color, piece: Piece) -> char {
     }
 }
 
-/// Hand-drawn piece art, 7 wide x 4 tall, using single-width block chars.
-fn piece_art(piece: Piece) -> [&'static str; 4] {
-    match piece {
-        Piece::Pawn => ["       ", "  ▄█▄  ", "  ▀█▀  ", " ▄███▄ "],
-        Piece::Knight => ["   ▄██ ", "  █▟█▔ ", "  ▀█▄  ", " ▄████▄"],
-        Piece::Bishop => ["       ", "  ▄◆▄  ", "  ▐█▌  ", " ▄████▄"],
-        Piece::Rook => ["       ", " █▘█▝█ ", " ▐███▌ ", "▐█████▌"],
-        Piece::Queen => [" ▘ █ ▝ ", " █████ ", " █████ ", "▐█████▌"],
-        Piece::King => ["   ▄   ", "  █+█  ", " █████ ", "▐█████▌"],
-    }
-}
-
 /// The desktop between the menu bar (top row) and the status bar (bottom row).
 fn body(area: Rect) -> Rect {
     Rect {
@@ -112,7 +99,8 @@ struct Geometry {
     labels_left: Rect, // rank labels column
     labels_bottom: Rect,
     panel: Rect,
-    big_art: bool,
+    /// `None` = cells too small for art; pieces are drawn as glyphs.
+    art: Option<ArtSize>,
 }
 
 /// Board and panel layout for the whole screen `area`; the bars are taken off first.
@@ -120,7 +108,8 @@ fn compute_geometry(area: Rect) -> Result<Geometry, ()> {
     let area = body(area);
     // height budget: frame top+bottom + file-label row
     let avail_h = area.height.saturating_sub(3);
-    let cell_h = (avail_h / 8).clamp(0, 6);
+    // tall enough for the largest piece art with its padding
+    let cell_h = (avail_h / 8).clamp(0, ArtSize::Large.min_cell().height);
     if cell_h < 3 {
         return Err(());
     }
@@ -177,7 +166,10 @@ fn compute_geometry(area: Rect) -> Result<Geometry, ()> {
         labels_left,
         labels_bottom,
         panel,
-        big_art: cell_h >= ART_H && cell_w >= ART_W,
+        art: ArtSize::for_cell(Size {
+            width: cell_w,
+            height: cell_h,
+        }),
     })
 }
 
@@ -733,11 +725,15 @@ fn draw_cells(f: &mut Frame, shown: &Shown, colors: &BoardColors, geo: &Geometry
                 Color::Black => colors.black_piece,
             };
             let st = base.fg(fg).add_modifier(Modifier::BOLD);
-            if geo.big_art {
-                let pad_top = (geo.cell_h - ART_H) / 2;
+            if let Some(size) = geo.art {
+                let pad_top = (geo.cell_h - size.size().height) / 2;
                 (0..pad_top)
                     .map(|_| Line::from(""))
-                    .chain(piece_art(piece).iter().map(|row| Line::styled(*row, st)))
+                    .chain(
+                        art::piece_art(piece, size)
+                            .into_iter()
+                            .map(|row| Line::styled(row, st)),
+                    )
                     .collect()
             } else {
                 centered(piece_glyph(color, piece).to_string(), st)
@@ -1345,7 +1341,7 @@ mod tests {
         g.cursor = (4, 1);
         g.confirm(now()); // select e2
         let content = render(&g, 100, 40);
-        assert!(content.contains('█'), "piece art should be rendered");
+        assert!(content.contains('♙'), "cells too small for art show glyphs");
         assert!(content.contains('●'), "legal target markers should appear");
         assert!(
             content.contains("─ Chess ─"),
@@ -1390,6 +1386,38 @@ mod tests {
         assert!(content.contains('♛'));
         assert!(content.contains("no warranty"), "status bar fits");
         assert!(content.contains("5. c3"), "at least 5 move rows fit");
+    }
+
+    #[test]
+    fn art_size_follows_the_terminal() {
+        // d2, not e2: the cursor starts on e2 and draws its corners in the padding
+        let d2_rows = |w, h| -> Vec<String> {
+            let buf = render_buf(&white_game(), w, h);
+            let cell = cell_area(&geo(w, h), Color::White, Square::D2);
+            (cell.top()..cell.bottom())
+                .map(|y| {
+                    (cell.left()..cell.right())
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect()
+                })
+                .collect()
+        };
+        assert!(d2_rows(100, 40).concat().contains('♙'), "8x4 cells: glyphs");
+        for (w, h, size) in [(130, 56, ArtSize::Small), (150, 72, ArtSize::Large)] {
+            let rows = d2_rows(w, h);
+            let text = rows.concat();
+            for row in art::piece_art(Piece::Pawn, size) {
+                assert!(text.contains(row.trim()), "{size:?} at {w}x{h}: {row:?}");
+            }
+            let blank = |s: &str| s.chars().all(|c| c == ' ');
+            assert!(blank(&rows[0]) && blank(&rows[rows.len() - 1]), "{size:?}");
+            for row in &rows {
+                assert!(
+                    row.starts_with(' ') && row.ends_with(' '),
+                    "{size:?}: {row:?}"
+                );
+            }
+        }
     }
 
     #[test]

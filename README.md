@@ -68,7 +68,7 @@ STOCKFISH_ARCHIVE=/path/to/stockfish-linux-x86-64-universal.tar.gz cargo build -
 
 Stockfish is bundled for Windows (x86-64, ARM64), Linux with glibc (x86-64, ARM64) and macOS. On other targets the game builds with the Rust engine only.
 
-Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. The window needs at least 79x29 characters; a larger window shows larger pieces.
+Use a terminal with true-colour support and a font that has chess glyphs, such as Windows Terminal, iTerm2, WezTerm, Kitty or Alacritty. The window needs at least 79x29 characters. Smaller windows show chess glyphs; block-art pieces appear from about 87x53 and grow larger from about 119x69.
 
 ## Usage
 
@@ -152,6 +152,7 @@ src/
 ├── settings.rs # remembered preferences
 ├── menu.rs     # menu bar contents and commands
 ├── theme.rs    # colour schemes in the VGA palette
+├── art.rs      # piece art: pixel bitmaps drawn with quadrant block characters
 ├── ai.rs       # Rust engine: search and PeSTO evaluation
 ├── engine.rs   # engine selection, levels and UCI protocol
 ├── bundled.rs  # embedded Stockfish binary and its extraction
