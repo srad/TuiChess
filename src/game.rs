@@ -142,6 +142,8 @@ pub struct Game {
     /// Suggested move for the side to move.
     pub hint: Option<ChessMove>,
     pub clock: Option<Clock>,
+    /// When the last move was played; drives the move animation.
+    pub moved_at: Option<Instant>,
     /// Endings that are not visible on the board: resignation, agreed draw, timeout.
     result: Option<Outcome>,
 }
@@ -172,6 +174,7 @@ impl Game {
             eval_depth: None,
             hint: None,
             clock: setup.time_control.map(Clock::new),
+            moved_at: None,
             result: None,
         }
     }
@@ -368,6 +371,7 @@ impl Game {
         };
         self.board = self.history[i].before;
         self.history.truncate(i);
+        self.moved_at = None;
         self.eval = None;
         self.eval_depth = None;
         self.hint = None;
@@ -543,6 +547,7 @@ impl Game {
             mv,
             san: notation,
         });
+        self.moved_at = Some(now);
         if let Some(clock) = &mut self.clock {
             clock.on_move(before.side_to_move(), now);
         }
@@ -974,9 +979,11 @@ pub(crate) mod tests {
     fn undo_takes_back_human_and_ai_move() {
         let mut g = white_game();
         play(&mut g, &[((4, 1), (4, 3)), ((4, 6), (4, 4))]); // 1.e4 e5
+        assert!(g.moved_at.is_some());
         assert!(g.undo(t()));
         assert_eq!(g.board, Board::default());
         assert!(g.history.is_empty());
+        assert_eq!(g.moved_at, None, "a take-back does not replay a slide");
         assert!(!g.undo(t()));
     }
 

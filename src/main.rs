@@ -137,7 +137,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         app.tick(now);
         terminal.draw(|f| ui::draw(f, &app.game, &app.view(now)))?;
 
-        if !event::poll(Duration::from_millis(50))? {
+        // Faster frames while a move slides.
+        let wait = if ui::animating(&app.game, now) {
+            16
+        } else {
+            50
+        };
+        if !event::poll(Duration::from_millis(wait))? {
             continue;
         }
         let now = Instant::now();

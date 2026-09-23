@@ -10,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::art::{self, ArtSize};
+use crate::art::{self, ArtSize, Shift};
 use crate::clock::{self, TimeControl};
 use crate::engine::{Eval, Level};
 use crate::game::{Game, Phase, captured_pieces, material, piece_letter, san};
@@ -18,6 +18,10 @@ use crate::menu::Menu;
 use crate::theme::{self, BoardColors, Chrome, Theme};
 
 const PANEL_W: u16 = 26;
+
+/// How long a moved piece slides: a base time plus a little per square travelled.
+const SLIDE_BASE: Duration = Duration::from_millis(120);
+const SLIDE_PER_SQUARE: Duration = Duration::from_millis(40);
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -33,7 +37,8 @@ pub enum Overlay {
 /// Per-frame state that is not part of the game itself.
 pub struct View<'a> {
     pub theme: &'a Theme,
-    pub tick: u64,
+    /// Frame of the thinking spinner.
+    pub spin: usize,
     pub now: Instant,
     /// Label while a search runs, e.g. "AI thinking…".
     pub thinking: Option<&'a str>,
@@ -639,17 +644,27 @@ fn draw_game(f: &mut Frame, game: &Game, view: &View, geo: &Geometry) {
         Some(ply) => game.position_at(ply),
         None => (game.board, game.last_move()),
     };
+    let moving = live.then(|| animation(game, view.now)).flatten();
+    let hidden: Vec<Square> = moving
+        .iter()
+        .flat_map(|m| m.slides.iter().map(|s| s.from))
+        .collect();
     draw_cells(
         f,
         &Shown {
             game,
             board: &board,
+            pieces: moving.as_ref().map_or(&board, |m| &m.before),
+            hidden: &hidden,
             last,
             live,
         },
         &view.theme.board,
         geo,
     );
+    if let Some(moving) = &moving {
+        draw_slides(f, moving, game.orientation, &view.theme.board, geo);
+    }
     if live && !game.game_over() {
         draw_cursor(f, game, &view.theme.board, geo);
     }
@@ -663,7 +678,12 @@ fn draw_game(f: &mut Frame, game: &Game, view: &View, geo: &Geometry) {
 /// The position on screen: live, or a past one while browsing.
 struct Shown<'a> {
     game: &'a Game,
+    /// The position the highlights belong to.
     board: &'a Board,
+    /// The position whose pieces are drawn: `board`, or the one before a sliding move.
+    pieces: &'a Board,
+    /// Squares whose piece in `pieces` is not drawn, because it is sliding away.
+    hidden: &'a [Square],
     last: Option<(Square, Square)>,
     /// Selection, targets and hint only show on the live position.
     live: bool,
@@ -681,7 +701,11 @@ fn draw_cells(f: &mut Frame, shown: &Shown, colors: &BoardColors, geo: &Geometry
     for sq in ALL_SQUARES {
         let cell = cell_area(geo, game.orientation, sq);
         let light = (sq.get_file().to_index() + sq.get_rank().to_index()) % 2 == 1;
-        let occupant = board.piece_on(sq).zip(board.color_on(sq));
+        let occupant = shown
+            .pieces
+            .piece_on(sq)
+            .zip(shown.pieces.color_on(sq))
+            .filter(|_| !shown.hidden.contains(&sq));
         let is_target = shown.live && game.legal_targets.contains(&sq);
 
         let mut bg = if light { colors.light } else { colors.dark };
@@ -695,7 +719,7 @@ fn draw_cells(f: &mut Frame, shown: &Shown, colors: &BoardColors, geo: &Geometry
         if hint.is_some_and(|(a, b)| sq == a || sq == b) {
             bg = colors.hint;
         }
-        if is_target && occupant.is_some() {
+        if is_target && board.piece_on(sq).is_some() {
             bg = colors.capture;
         }
         if shown.live && game.phase == Phase::Selected(sq) {
@@ -706,40 +730,10 @@ fn draw_cells(f: &mut Frame, shown: &Shown, colors: &BoardColors, geo: &Geometry
         }
 
         let base = Style::default().bg(bg);
-        let mid = geo.cell_h / 2;
-        let centered = |text: String, style: Style| -> Vec<Line<'static>> {
-            (0..geo.cell_h)
-                .map(|i| {
-                    if i == mid {
-                        Line::styled(text.clone(), style)
-                    } else {
-                        Line::from("")
-                    }
-                })
-                .collect()
-        };
-
         let lines: Vec<Line> = if let Some((piece, color)) = occupant {
-            let fg = match color {
-                Color::White => colors.white_piece,
-                Color::Black => colors.black_piece,
-            };
-            let st = base.fg(fg).add_modifier(Modifier::BOLD);
-            if let Some(size) = geo.art {
-                let pad_top = (geo.cell_h - size.size().height) / 2;
-                (0..pad_top)
-                    .map(|_| Line::from(""))
-                    .chain(
-                        art::piece_art(piece, size)
-                            .into_iter()
-                            .map(|row| Line::styled(row, st)),
-                    )
-                    .collect()
-            } else {
-                centered(piece_glyph(color, piece).to_string(), st)
-            }
+            piece_lines(piece, color, colors, geo)
         } else if is_target {
-            centered("●".to_string(), base.fg(colors.target))
+            mid_row(geo, "●".to_string(), base.fg(colors.target))
         } else {
             Vec::new()
         };
@@ -750,6 +744,204 @@ fn draw_cells(f: &mut Frame, shown: &Shown, colors: &BoardColors, geo: &Geometry
                 .alignment(Alignment::Center),
             cell,
         );
+    }
+}
+
+/// `text` on the middle row of a board cell.
+fn mid_row(geo: &Geometry, text: String, style: Style) -> Vec<Line<'static>> {
+    let mid = geo.cell_h / 2;
+    (0..geo.cell_h)
+        .map(|i| {
+            if i == mid {
+                Line::styled(text.clone(), style)
+            } else {
+                Line::from("")
+            }
+        })
+        .collect()
+}
+
+fn piece_style(color: Color, colors: &BoardColors) -> Style {
+    let fg = match color {
+        Color::White => colors.white_piece,
+        Color::Black => colors.black_piece,
+    };
+    Style::default().fg(fg).add_modifier(Modifier::BOLD)
+}
+
+/// A piece as drawn in its board cell (centre-aligned): art padded from the top, or a glyph.
+fn piece_lines(
+    piece: Piece,
+    color: Color,
+    colors: &BoardColors,
+    geo: &Geometry,
+) -> Vec<Line<'static>> {
+    let style = piece_style(color, colors);
+    match geo.art {
+        Some(size) => {
+            let pad_top = (geo.cell_h - size.size().height) / 2;
+            (0..pad_top)
+                .map(|_| Line::from(""))
+                .chain(
+                    art::piece_art(piece, size)
+                        .into_iter()
+                        .map(|row| Line::styled(row, style)),
+                )
+                .collect()
+        }
+        None => mid_row(geo, piece_glyph(color, piece).to_string(), style),
+    }
+}
+
+/// A piece travelling from one square to another while a move animates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Slide {
+    piece: Piece,
+    color: Color,
+    from: Square,
+    to: Square,
+}
+
+/// The pieces `mv` moves when played on `before`: one, or king and rook when castling.
+fn slides(before: &Board, mv: ChessMove) -> Vec<Slide> {
+    let (from, to) = (mv.get_source(), mv.get_dest());
+    let (Some(piece), Some(color)) = (before.piece_on(from), before.color_on(from)) else {
+        return Vec::new();
+    };
+    let mut slides = vec![Slide {
+        piece,
+        color,
+        from,
+        to,
+    }];
+    let (from_file, to_file) = (from.get_file().to_index(), to.get_file().to_index());
+    if piece == Piece::King && from_file.abs_diff(to_file) == 2 {
+        let (rook_from, rook_to) = if to_file > from_file {
+            (File::H, File::F)
+        } else {
+            (File::A, File::D)
+        };
+        let rank = from.get_rank();
+        slides.push(Slide {
+            piece: Piece::Rook,
+            color,
+            from: Square::make_square(rank, rook_from),
+            to: Square::make_square(rank, rook_to),
+        });
+    }
+    slides
+}
+
+/// The last move while it animates: the position it was played from, and what slides.
+struct Animation {
+    before: Board,
+    slides: Vec<Slide>,
+    /// 0 = on the source squares, 1 = arrived.
+    progress: f32,
+}
+
+/// How long `mv` slides: longer moves take longer, but travel faster.
+fn slide_duration(mv: ChessMove) -> Duration {
+    let (from, to) = (mv.get_source(), mv.get_dest());
+    let file = |sq: Square| sq.get_file().to_index();
+    let rank = |sq: Square| sq.get_rank().to_index();
+    let files = file(from).abs_diff(file(to));
+    let ranks = rank(from).abs_diff(rank(to));
+    SLIDE_BASE + SLIDE_PER_SQUARE * files.max(ranks) as u32
+}
+
+/// How far through its animation the last move is (0..1), while it animates.
+fn animation_time(game: &Game, now: Instant) -> Option<f32> {
+    let elapsed = now.saturating_duration_since(game.moved_at?);
+    let duration = slide_duration(game.history.last()?.mv);
+    (elapsed < duration).then(|| elapsed.as_secs_f32() / duration.as_secs_f32())
+}
+
+/// Whether the last move is still sliding, so frames should come faster.
+pub fn animating(game: &Game, now: Instant) -> bool {
+    animation_time(game, now).is_some()
+}
+
+fn animation(game: &Game, now: Instant) -> Option<Animation> {
+    let t = animation_time(game, now)?;
+    let ply = game.history.last()?;
+    Some(Animation {
+        before: ply.before,
+        slides: slides(&ply.before, ply.mv),
+        progress: t * t * (3.0 - 2.0 * t), // ease in and out
+    })
+}
+
+/// Where a piece drawn in `sq`'s cell starts: its top-left character, as `piece_lines` places
+/// it under centre alignment.
+fn piece_origin(geo: &Geometry, orientation: Color, sq: Square) -> Position {
+    let cell = cell_area(geo, orientation, sq);
+    let (dx, dy) = match geo.art {
+        Some(size) => {
+            let Size { width, height } = size.size();
+            (geo.cell_w / 2 - width / 2, (geo.cell_h - height) / 2)
+        }
+        None => (geo.cell_w / 2, geo.cell_h / 2),
+    };
+    Position {
+        x: cell.x + dx,
+        y: cell.y + dy,
+    }
+}
+
+/// `slide`'s piece at `progress`: its rows and the character they start at. Art moves in
+/// quadrant pixels (half characters), glyphs in whole characters.
+fn sprite(
+    geo: &Geometry,
+    orientation: Color,
+    slide: &Slide,
+    progress: f32,
+) -> (Vec<String>, Position) {
+    let steps: u16 = if geo.art.is_some() { 2 } else { 1 }; // positions per character
+    let from = piece_origin(geo, orientation, slide.from);
+    let to = piece_origin(geo, orientation, slide.to);
+    let lerp = |a: u16, b: u16| {
+        let (a, b) = (f32::from(a * steps), f32::from(b * steps));
+        (a + (b - a) * progress).round() as u16
+    };
+    let (x, y) = (lerp(from.x, to.x), lerp(from.y, to.y));
+    let rows = match geo.art {
+        Some(size) => art::shifted_piece_art(
+            slide.piece,
+            size,
+            Shift {
+                right: x % 2 == 1,
+                down: y % 2 == 1,
+            },
+        ),
+        None => vec![piece_glyph(slide.color, slide.piece).to_string()],
+    };
+    let at = Position {
+        x: x / steps,
+        y: y / steps,
+    };
+    (rows, at)
+}
+
+/// The sliding pieces over the board; blank parts of a piece let the squares show through.
+fn draw_slides(
+    f: &mut Frame,
+    moving: &Animation,
+    orientation: Color,
+    colors: &BoardColors,
+    geo: &Geometry,
+) {
+    let buf = f.buffer_mut();
+    for slide in &moving.slides {
+        let style = piece_style(slide.color, colors);
+        let (rows, at) = sprite(geo, orientation, slide, moving.progress);
+        for (dy, row) in (0..).zip(&rows) {
+            for (dx, c) in (0..).zip(row.chars()) {
+                if c != ' ' {
+                    buf[(at.x + dx, at.y + dy)].set_char(c).set_style(style);
+                }
+            }
+        }
     }
 }
 
@@ -840,22 +1032,32 @@ fn eval_bar(width: usize, eval: Option<Eval>) -> Line<'static> {
     ])
 }
 
-/// SAN with piece letters replaced by figurines of the mover's colour.
+/// SAN with piece letters replaced by figurines of the mover's colour, each followed by a
+/// space so it does not run into the next character: "♘ f3", "e8=♕ +".
 fn figurine(san: &str, mover: Color) -> String {
-    san.chars()
-        .map(|c| {
-            [
-                Piece::King,
-                Piece::Queen,
-                Piece::Rook,
-                Piece::Bishop,
-                Piece::Knight,
-            ]
-            .into_iter()
-            .find(|&p| piece_letter(p) == c)
-            .map_or(c, |p| piece_glyph(mover, p))
-        })
-        .collect()
+    let mut out = String::new();
+    let mut chars = san.chars().peekable();
+    while let Some(c) = chars.next() {
+        let piece = [
+            Piece::King,
+            Piece::Queen,
+            Piece::Rook,
+            Piece::Bishop,
+            Piece::Knight,
+        ]
+        .into_iter()
+        .find(|&p| piece_letter(p) == c);
+        match piece {
+            Some(p) => {
+                out.push(piece_glyph(mover, p));
+                if chars.peek().is_some() {
+                    out.push(' ');
+                }
+            }
+            None => out.push(c),
+        }
+    }
+    out
 }
 
 /// A line of moves from `board` in figurine SAN, cut to `width` characters.
@@ -938,7 +1140,7 @@ fn draw_panel(f: &mut Frame, game: &Game, view: &View, rect: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     } else if let Some(label) = view.thinking {
-        let spin = SPINNER[(view.tick as usize / 2) % SPINNER.len()];
+        let spin = SPINNER[view.spin % SPINNER.len()];
         status.push(Line::from(vec![
             Span::styled(format!("{spin} "), dim),
             Span::styled(label.to_string(), Style::default().fg(chrome.value)),
@@ -1276,8 +1478,9 @@ mod tests {
     fn view() -> View<'static> {
         View {
             theme: &THEMES[0],
-            tick: 0,
-            now: Instant::now(),
+            spin: 0,
+            // Past any move animation, so a render shows the position after the moves.
+            now: Instant::now() + Duration::from_secs(1),
             thinking: None,
             engine_name: "built-in",
             level: Level::DEFAULT,
@@ -1432,7 +1635,7 @@ mod tests {
         let mut g = white_game();
         play(&mut g, &[((6, 0), (5, 2))]); // Nf3
         let content = render(&g, 100, 40);
-        assert!(content.contains("♘f3"), "figurine notation");
+        assert!(content.contains("♘ f3"), "figurine notation");
         assert!(content.contains("Material"));
         assert!(
             content.contains("─ Moves ─"),
@@ -1502,7 +1705,7 @@ mod tests {
         v.engine_line = Some((&board, &moves));
         let content = text(&render_buf_with(&g, &v, 100, 40));
         assert!(content.contains("+0.35  d18"));
-        assert!(content.contains("e4 e5 ♘f3"));
+        assert!(content.contains("e4 e5 ♘ f3"));
         g.eval = Some(Eval::Mate(-3));
         assert!(render(&g, 100, 40).contains("-M3"));
         assert_eq!(eval_fraction(Some(Eval::Cp(0))), 0.5);
@@ -1565,6 +1768,136 @@ mod tests {
         let e2 = cell_area(&geo, Color::White, Square::E2);
         assert_eq!(buf[(e2.x + 1, e2.y + 1)].bg, THEMES[0].board.light);
         assert!(!text(&buf).contains('┏'), "no cursor while browsing");
+    }
+
+    #[test]
+    fn figurines_are_spaced_from_what_follows() {
+        assert_eq!(figurine("Nbd2", Color::White), "♘ bd2");
+        assert_eq!(figurine("Qxh7#", Color::Black), "♛ xh7#");
+        assert_eq!(figurine("e8=Q+", Color::White), "e8=♕ +");
+        assert_eq!(figurine("e8=Q", Color::White), "e8=♕", "no trailing space");
+        assert_eq!(figurine("O-O", Color::White), "O-O");
+        // The longest moves still leave a gap in the 9-wide move list column.
+        assert_eq!(figurine("Qa1xh8#", Color::White).chars().count(), 8);
+        assert_eq!(figurine("exd8=Q+", Color::White).chars().count(), 8);
+    }
+
+    fn count_in(buf: &Buffer, rect: Rect, symbol: &str) -> usize {
+        rect.positions()
+            .filter(|&pos| buf[pos].symbol() == symbol)
+            .count()
+    }
+
+    #[test]
+    fn moved_piece_slides_to_its_square() {
+        let mut g = white_game();
+        play(&mut g, &[((4, 1), (4, 3))]); // e4
+        let moved_at = g.moved_at.expect("a move was played");
+        let duration = slide_duration(g.history[0].mv);
+        let geo = geo(100, 40);
+        assert!(geo.art.is_none(), "glyph mode at this size");
+        let (e2, e4) = (
+            cell_area(&geo, Color::White, Square::E2),
+            cell_area(&geo, Color::White, Square::E4),
+        );
+
+        let mut v = view();
+        v.now = moved_at + duration / 2;
+        assert!(animating(&g, v.now));
+        let buf = render_buf_with(&g, &v, 100, 40);
+        assert_eq!(count_in(&buf, e2, "♙"), 0, "left the source");
+        assert_eq!(count_in(&buf, e4, "♙"), 0, "not arrived yet");
+        assert_eq!(
+            count_in(&buf, geo.board, "♙"),
+            8,
+            "seven at home, one on the way"
+        );
+
+        v.now = moved_at + duration;
+        assert!(!animating(&g, v.now));
+        let end = render_buf_with(&g, &v, 100, 40);
+        assert_eq!(count_in(&end, e4, "♙"), 1);
+        g.moved_at = None;
+        assert_eq!(
+            end,
+            render_buf_with(&g, &v, 100, 40),
+            "ends on the plain position"
+        );
+    }
+
+    #[test]
+    fn castling_slides_king_and_rook() {
+        let board: Board = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1".parse().unwrap();
+        let slide = |piece, from, to| Slide {
+            piece,
+            color: Color::White,
+            from,
+            to,
+        };
+        assert_eq!(
+            slides(&board, ChessMove::new(Square::E1, Square::G1, None)),
+            [
+                slide(Piece::King, Square::E1, Square::G1),
+                slide(Piece::Rook, Square::H1, Square::F1)
+            ]
+        );
+        assert_eq!(
+            slides(&board, ChessMove::new(Square::E1, Square::C1, None)),
+            [
+                slide(Piece::King, Square::E1, Square::C1),
+                slide(Piece::Rook, Square::A1, Square::D1)
+            ]
+        );
+        assert_eq!(
+            slides(&board, ChessMove::new(Square::E1, Square::F1, None)),
+            [slide(Piece::King, Square::E1, Square::F1)]
+        );
+    }
+
+    #[test]
+    fn slide_runs_from_source_to_destination_in_half_characters() {
+        let slide = Slide {
+            piece: Piece::Knight,
+            color: Color::Black,
+            from: Square::G8,
+            to: Square::F6,
+        };
+        for (w, h) in [(100, 40), (130, 56), (150, 72)] {
+            let geo = geo(w, h);
+            let still = match geo.art {
+                Some(size) => art::piece_art(Piece::Knight, size),
+                None => vec!["♞".to_string()],
+            };
+            for orientation in [Color::White, Color::Black] {
+                let at = |sq| piece_origin(&geo, orientation, sq);
+                let sprite = |progress| sprite(&geo, orientation, &slide, progress);
+                assert_eq!(sprite(0.0), (still.clone(), at(Square::G8)), "{w}x{h}");
+                assert_eq!(sprite(1.0), (still.clone(), at(Square::F6)), "{w}x{h}");
+
+                // The origin is where a standing piece is drawn.
+                let mut g = white_game();
+                g.orientation = orientation;
+                let buf = render_buf(&g, w, h);
+                let origin = at(Square::G8);
+                for (dy, row) in (0..).zip(&still) {
+                    for (dx, c) in (0..).zip(row.chars()) {
+                        let cell = &buf[(origin.x + dx, origin.y + dy)];
+                        assert_eq!(cell.symbol(), c.to_string(), "{w}x{h} {orientation:?}");
+                    }
+                }
+            }
+            if let Some(size) = geo.art {
+                // One pixel down a file: the art is shifted by half a character.
+                let down = Slide {
+                    to: Square::G7,
+                    ..slide
+                };
+                let step = 1.0 / f32::from(2 * geo.cell_h);
+                let (rows, at) = sprite(&geo, Color::White, &down, step);
+                assert_eq!(rows.len(), size.size().height as usize + 1, "{w}x{h}");
+                assert_eq!(at, piece_origin(&geo, Color::White, Square::G8));
+            }
+        }
     }
 
     #[test]

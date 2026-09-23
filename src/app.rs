@@ -20,6 +20,8 @@ use crate::theme::{self, THEMES};
 use crate::ui::{self, MenuHit};
 
 const NOTICE_TIME: Duration = Duration::from_secs(4);
+/// How long the thinking spinner shows each frame.
+const SPIN_FRAME: Duration = Duration::from_millis(100);
 /// Thinking time per move without a clock, and for hints.
 const MOVE_TIME: Duration = Duration::from_secs(1);
 /// Extra time before an unanswered search counts as a hung engine.
@@ -85,6 +87,7 @@ struct Pending {
     version: u64,
     purpose: Purpose,
     rx: Receiver<SearchEvent>,
+    started: Instant,
     deadline: Instant,
 }
 
@@ -122,7 +125,6 @@ pub struct App {
     last_restart: Option<Instant>,
     /// The engine's expected line and the position it starts from.
     engine_line: Option<(Board, Vec<ChessMove>)>,
-    tick: u64,
 }
 
 fn promotion_piece(c: char) -> Option<Piece> {
@@ -193,7 +195,6 @@ impl App {
             engine_failed: false,
             last_restart: None,
             engine_line: None,
-            tick: 0,
         };
         app.new_game();
         app
@@ -273,7 +274,6 @@ impl App {
     // ----- time-driven work -------------------------------------------------------------
 
     pub fn tick(&mut self, now: Instant) {
-        self.tick = self.tick.wrapping_add(1);
         if self
             .notice
             .as_ref()
@@ -410,6 +410,7 @@ impl App {
             version: self.version,
             purpose,
             rx,
+            started: now,
             deadline,
         });
     }
@@ -908,7 +909,10 @@ impl App {
     pub fn view(&self, now: Instant) -> ui::View<'_> {
         ui::View {
             theme: &THEMES[theme::theme_index(&self.settings.theme)],
-            tick: self.tick,
+            spin: self.pending.as_ref().map_or(0, |p| {
+                (now.saturating_duration_since(p.started).as_millis() / SPIN_FRAME.as_millis())
+                    as usize
+            }),
             now,
             thinking: self.pending.as_ref().map(|p| match p.purpose {
                 Purpose::EngineMove => "AI thinking…",

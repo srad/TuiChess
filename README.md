@@ -21,6 +21,7 @@ Play chess against an engine in your terminal.
 - MS-DOS look: menu bar, blue desktop, single-line boxes and dialogs with drop shadows
 - Menus for the game, level, clock, engine, theme and help, by keyboard (`F10`, `Alt`+letter) or mouse
 - Block-art pieces that scale with the terminal, with Unicode glyphs as a fallback for small windows
+- Moves slide across the board, the rook included when castling
 - Mouse and keyboard input: click or drag pieces, or use the arrow keys or `hjkl`
 - Play as White or Black against the engine, or two players on one machine
 - Stockfish 19 is built into the executable: nothing else to install
@@ -32,7 +33,7 @@ Play chess against an engine in your terminal.
 - Step back through the game's positions without undoing moves
 - Start from any position given as FEN
 - Undo, which takes back your last move and the engine's reply
-- Move list in algebraic notation with piece symbols (`♘f3`, `Nbd2`, `O-O`, `e8=Q#`)
+- Move list in algebraic notation with piece symbols (`♘ f3`, `Nbd2`, `O-O`, `e8=Q#`)
 - Full rules: castling, en passant, promotion, checkmate, stalemate, threefold repetition, the fifty-move rule and insufficient material
 - Three colour schemes in the 16-colour VGA palette: Blue, Black and Mono
 - Settings (theme, side, level, mode, clock, engine) are remembered between runs
@@ -154,7 +155,7 @@ src/
 ├── ai.rs       # Rust engine: search and PeSTO evaluation
 ├── engine.rs   # engine selection, levels and UCI protocol
 ├── bundled.rs  # embedded Stockfish binary and its extraction
-└── ui.rs       # menu and status bars, board, panel, dialogs (ratatui)
+└── ui.rs       # menu and status bars, board and move animation, panel, dialogs (ratatui)
 build.rs        # downloads, verifies and extracts Stockfish at build time
 ```
 

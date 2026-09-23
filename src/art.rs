@@ -53,6 +53,30 @@ pub fn piece_art(piece: Piece, size: ArtSize) -> Vec<String> {
     quadrants(bitmap(piece, size))
 }
 
+/// Which way art is moved by one pixel (half a character), to draw it between character
+/// positions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Shift {
+    pub right: bool,
+    pub down: bool,
+}
+
+/// `piece_art` moved by `shift`: one character wider when moved right, one taller when moved
+/// down.
+pub fn shifted_piece_art(piece: Piece, size: ArtSize, shift: Shift) -> Vec<String> {
+    let side = if shift.right { "." } else { "" };
+    let mut rows: Vec<String> = bitmap(piece, size)
+        .iter()
+        .map(|row| format!("{side}{row}{side}"))
+        .collect();
+    if shift.down {
+        let blank = ".".repeat(rows[0].len());
+        rows.insert(0, blank.clone());
+        rows.push(blank);
+    }
+    quadrants(&rows.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
 fn bitmap(piece: Piece, size: ArtSize) -> &'static [&'static str] {
     match (size, piece) {
         (ArtSize::Small, Piece::Pawn) => &SMALL_PAWN,
@@ -336,6 +360,32 @@ mod tests {
             for (i, a) in PIECES.iter().enumerate() {
                 for b in &PIECES[i + 1..] {
                     assert_ne!(piece_art(*a, size), piece_art(*b, size), "{a:?} {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shifted_art_keeps_every_pixel() {
+        let pixels = |art: &[String]| -> u32 {
+            art.iter()
+                .flat_map(|row| row.chars())
+                .map(|c| QUADRANTS.iter().position(|&q| q == c).unwrap() as u32)
+                .map(u32::count_ones)
+                .sum()
+        };
+        for size in SIZES {
+            let Size { width, height } = size.size();
+            for piece in PIECES {
+                let plain = piece_art(piece, size);
+                assert_eq!(shifted_piece_art(piece, size, Shift::default()), plain);
+                for (right, down) in [(true, false), (false, true), (true, true)] {
+                    let art = shifted_piece_art(piece, size, Shift { right, down });
+                    assert_ne!(art, plain, "{piece:?} {size:?} moved");
+                    assert_eq!(pixels(&art), pixels(&plain), "{piece:?} {size:?}");
+                    assert_eq!(art.len(), (height + u16::from(down)) as usize);
+                    let w = (width + u16::from(right)) as usize;
+                    assert!(art.iter().all(|r| r.chars().count() == w));
                 }
             }
         }
