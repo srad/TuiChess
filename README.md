@@ -12,7 +12,7 @@ Play chess against an engine in your terminal.
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#installation)
 
 <!-- Screenshot: save one as docs/screenshot.png (or change the path) -->
-<img src="docs/screenshot.png" alt="TuiChess screenshot" width="800">
+<img width="1388" height="1180" alt="screenshot" src="https://github.com/user-attachments/assets/b0129db5-8032-4da6-bb1d-6cd54723c38c" />
 
 </div>
 
